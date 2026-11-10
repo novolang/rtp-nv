@@ -1,0 +1,252 @@
+// rtcptimer.nv — when to send the next RTCP packet: section 6.3 of RFC 3550,
+// as a step the caller drives with its own timer.  No allocation.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  The package has no
+// clock and no random source.  The caller says what time it is, in
+// milliseconds on any clock it keeps, and supplies a draw from 0 to 1000 for
+// the random factor; a fixed draw makes the schedule repeatable in a test.
+//
+// THE RULE.  The RTCP packets of all the members of a session together use
+// a fixed share of the session's bandwidth, 5 % by default (`rtcp_bandwidth`
+// computes it), so the interval between one member's packets grows with the
+// number of members.  The deterministic interval is
+//
+//     Td = avg_rtcp_size * n / rtcp_bw
+//
+// with n the number of members, or, when there are senders and they are fewer
+// than a quarter of the members, the senders' 25 % share and the receivers'
+// 75 % share separately (section 6.3.1).  Td is at least 5 seconds, and
+// 2.5 seconds before the first packet has been sent.  The interval used is
+// Td times a random number between 0.5 and 1.5, divided by e - 3/2 = 1.21828
+// to compensate for the bias that reconsideration introduces.
+//
+// RECONSIDERATION.  When the timer runs out, the interval is computed again
+// with the members as they are now, and the packet is sent only if the time
+// since the last one has reached it (`timer_check`); otherwise the timer is
+// set for the new time.  When the number of members falls, the timer is
+// pulled in by the ratio of the new count to the old (section 6.3.4,
+// `timer_members_changed`).
+//
+// LEAVING.  A member that leaves sends a BYE.  When there are more than 50
+// members a BYE goes through a backoff (section 6.3.7): the member counts as
+// alone, plans on a BYE-sized average, and counts the BYEs it hears
+// (`timer_bye` and `timer_bye_heard`).
+
+use rtpbytes
+
+// The shortest interval between RTCP packets after the first, in
+// milliseconds: 5000.
+pub const RTCP_MIN_MS = 5000
+// The shortest wait before the first RTCP packet, in milliseconds: 2500, half
+// of `RTCP_MIN_MS`.
+pub const RTCP_MIN_INITIAL_MS = 2500
+
+// `timer_check`: nothing to send yet.
+pub const RTCP_WAIT = 0
+// `timer_check`: send the packet now, then call `timer_sent`.
+pub const RTCP_SEND = 1
+
+// The state of the report timer of one member.
+pub @value
+struct RtcpTimer
+    // The members of the session, this one counted.
+    members: Int
+    // The members when the interval was last computed.
+    pmembers: Int
+    // The members that have sent RTP lately.
+    senders: Int
+    // Whether this member has sent RTP lately.
+    we_sent: Bool
+    // True until the first packet has been sent.
+    initial: Bool
+    // The average size of the RTCP packets heard and sent, scaled by 16, in
+    // bytes.
+    avg16: Int
+    // The RTCP bandwidth in bytes a second.
+    bw: Int
+    // When the last packet was sent, in milliseconds.
+    tp: Int
+    // When the next one is due, in milliseconds.
+    tn: Int
+
+// The RTCP share of a session's bandwidth: 5 %, in bytes a second, from the
+// session bandwidth in bits a second.
+//
+// ```novo
+// use rtcptimer
+//
+// fn main() [io]
+//     println("${rtcptimer.rtcp_bandwidth(64000)}")   // 400
+// ```
+pub @tier(embedded)
+@no_alloc
+fn rtcp_bandwidth(session_bits_per_s: Int) -> Int []
+    session_bits_per_s * 5 / 100 / 8
+
+// The interval before the next RTCP packet in milliseconds, with the random
+// factor applied (section 6.3.1).
+//
+// `bw` is the RTCP bandwidth in bytes a second, `avg_size` the average RTCP
+// packet size in bytes, and `draw` a number from 0 to 1000 (outside it, held
+// to it) that stands for the random factor 0.5 to 1.5.
+//
+// ```novo
+// use rtcptimer
+//
+// fn main() [io]
+//     // 100 members, none sending, 400 bytes a second, 100-byte packets:
+//     // Td is 25 seconds, and a draw of 500 is a factor of 1.0.
+//     println("${rtcptimer.rtcp_interval(100, 0, 400, false, 100, false, 500)}")   // 20520
+// ```
+pub @tier(embedded)
+@no_alloc
+fn rtcp_interval(members: Int, senders: Int, bw: Int, we_sent: Bool, avg_size: Int, initial: Bool,
+                 draw: Int) -> Int []
+    var floor_ms = RTCP_MIN_MS
+    if initial
+        floor_ms = RTCP_MIN_INITIAL_MS
+    var rate = bw
+    if rate < 1
+        rate = 1
+    var n = members
+    var td = 0
+    if senders > 0 and senders * 4 < members
+        if we_sent
+            n = senders
+            td = avg_size * n * 1000 * 4 / rate
+        else
+            n = members - senders
+            td = avg_size * n * 1000 * 4 / (3 * rate)
+    else
+        td = avg_size * n * 1000 / rate
+    if td < floor_ms
+        td = floor_ms
+    var d = draw
+    if d < 0
+        d = 0
+    if d > 1000
+        d = 1000
+    td * (500 + d) * 100 / 121828
+
+// A timer for a member that has just joined: alone in the session (members
+// 1), nothing sent, and the first packet due after the initial interval.
+//
+// `first_size` is the size in bytes of the first RTCP packet it will send,
+// which the RFC makes the starting value of the average.
+pub @tier(embedded)
+@no_alloc
+fn timer_new(bw: Int, first_size: Int, now_ms: Int, draw: Int) -> RtcpTimer []
+    RtcpTimer { members: 1, pmembers: 1, senders: 0, we_sent: false, initial: true,
+                avg16: first_size * 16, bw: bw, tp: now_ms,
+                tn: now_ms + rtcp_interval(1, 0, bw, false, first_size, true, draw) }
+
+// The interval in milliseconds the timer would use now.
+@tier(embedded)
+@no_alloc
+fn interval_of(t: RtcpTimer, draw: Int) -> Int []
+    rtcp_interval(t.members, t.senders, t.bw, t.we_sent, t.avg16 / 16, t.initial, draw)
+
+// Whether the timer has run out at `now_ms`, and what to do about it
+// (sections 6.3.2 and 6.3.3).
+//
+// `RTCP_WAIT` before the due time, and after it when the interval,
+// recomputed, puts the packet later (the due time is then moved).
+// `RTCP_SEND` when the packet is due: send it, then call `timer_sent`.
+//
+// ```novo
+// use rtcptimer
+//
+// fn main() [io]
+//     var t = rtcptimer.timer_new(400, 100, 0, 500)
+//     let early = rtcptimer.timer_check(var t, 1000, 500)
+//     let due = rtcptimer.timer_check(var t, t.tn, 500)
+//     println("${early} ${due} ${t.tn}")   // 0 1 2052
+// ```
+pub @tier(embedded)
+@no_alloc
+fn timer_check(var t: RtcpTimer, now_ms: Int, draw: Int) -> Int []
+    if now_ms < t.tn
+        return RTCP_WAIT
+    let due = t.tp + interval_of(t, draw)
+    if due <= now_ms
+        return RTCP_SEND
+    t.tn = due
+    RTCP_WAIT
+
+// Record that an RTCP packet of `size` bytes was sent at `now_ms`, and
+// schedule the next.
+pub @tier(embedded)
+@no_alloc
+fn timer_sent(var t: RtcpTimer, size: Int, now_ms: Int, draw: Int) []
+    t.avg16 = size + 15 * t.avg16 / 16
+    t.tp = now_ms
+    t.initial = false
+    t.pmembers = t.members
+    t.tn = now_ms + interval_of(t, draw)
+
+// Take an RTCP packet of `size` bytes received from another member into the
+// average size.
+pub @tier(embedded)
+@no_alloc
+fn timer_heard(var t: RtcpTimer, size: Int) []
+    t.avg16 = size + 15 * t.avg16 / 16
+
+// The membership changed: `members` now, of which `senders` are sending.
+//
+// When the count fell, the timer is pulled in by the ratio of the new count
+// to the old (section 6.3.4): the next send and the last send both move
+// toward `now_ms` by that ratio.
+//
+// ```novo
+// use rtcptimer
+//
+// fn main() [io]
+//     var t = rtcptimer.timer_new(400, 100, 0, 500)
+//     rtcptimer.timer_members_changed(var t, 0, 10, 0)
+//     rtcptimer.timer_sent(var t, 100, 0, 500)
+//     rtcptimer.timer_members_changed(var t, 0, 5, 0)
+//     println("${t.members} ${t.pmembers} ${t.tn}")   // 5 5 2052
+// ```
+pub @tier(embedded)
+@no_alloc
+fn timer_members_changed(var t: RtcpTimer, now_ms: Int, members: Int, senders: Int) []
+    t.senders = senders
+    if members < t.pmembers and t.pmembers > 0
+        t.tn = now_ms + members * (t.tn - now_ms) / t.pmembers
+        t.tp = now_ms - members * (now_ms - t.tp) / t.pmembers
+        t.pmembers = members
+    t.members = members
+
+// Whether this member is sending RTP.
+pub @tier(embedded)
+@no_alloc
+fn timer_we_sent(var t: RtcpTimer, sent: Bool) []
+    t.we_sent = sent
+
+// Prepare to send a BYE (section 6.3.7): the member counts as alone, plans on
+// a BYE of `size` bytes, and waits the initial interval from `now_ms`.
+pub @tier(embedded)
+@no_alloc
+fn timer_bye(var t: RtcpTimer, size: Int, now_ms: Int, draw: Int) []
+    t.members = 1
+    t.pmembers = 1
+    t.senders = 0
+    t.we_sent = false
+    t.initial = true
+    t.avg16 = size * 16
+    t.tp = now_ms
+    t.tn = now_ms + interval_of(t, draw)
+
+// A BYE of `size` bytes was heard while this member waits to send its own:
+// one more member in the count, and the average moves toward `size`.
+pub @tier(embedded)
+@no_alloc
+fn timer_bye_heard(var t: RtcpTimer, size: Int) []
+    t.members = t.members + 1
+    t.avg16 = size + 15 * t.avg16 / 16
+
+// The time in milliseconds at which the next packet is due.
+pub @tier(embedded)
+@no_alloc
+fn timer_due(t: RtcpTimer) -> Int []
+    t.tn

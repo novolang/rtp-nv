@@ -1,0 +1,237 @@
+// rtpstatic.nv — the payload types that RFC 3551 assigns, as functions over
+// the number in the payload-type field of an RTP packet.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  The table is
+// compiled into the functions as comparisons, so it lives in flash and a
+// lookup allocates nothing.
+//
+// WHAT RFC 3551 FIXES.  Tables 4 and 5 give each assigned payload type a
+// short name, a media kind, a clock rate and, for audio, a channel count.
+// The values 96 to 127 are dynamic: a session description binds each to an
+// encoding for the duration of the session, and nothing here knows what it
+// means.  The values 72 to 76 are reserved so that an RTCP packet type
+// (200 to 204 with the marker bit set) cannot be mistaken for an RTP
+// payload type, and 1, 2, 19 are reserved by the table.
+//
+// THE CLOCK OF G.722 IS 8000 although its samples are taken at 16000 Hz:
+// RFC 3551 section 4.5.2 keeps the clock the value it had when the type was
+// assigned.  `pt_clock` answers the RTP clock, which is what a timestamp
+// counts, and not the sampling rate.
+//
+// Names are written as the RFC writes them and are compared without regard
+// to case, because an `a=rtpmap` line in SDP may use either.
+
+// The payload type is not one RFC 3551 assigns, and not in the dynamic or
+// reserved ranges either.
+pub const RTP_KIND_UNASSIGNED = 0
+// The payload type carries audio.
+pub const RTP_KIND_AUDIO = 1
+// The payload type carries video.
+pub const RTP_KIND_VIDEO = 2
+// The payload type carries audio and video together (MP2T).
+pub const RTP_KIND_AUDIOVIDEO = 3
+// The payload type is reserved by RFC 3551, or reserved so that it cannot be
+// taken for an RTCP packet type.
+pub const RTP_KIND_RESERVED = 4
+// The payload type, 96 to 127, is bound to an encoding by a session
+// description.
+pub const RTP_KIND_DYNAMIC = 5
+
+// The first dynamic payload type: 96.
+pub const RTP_PT_DYNAMIC_FIRST = 96
+// The last dynamic payload type: 127.
+pub const RTP_PT_DYNAMIC_LAST = 127
+
+// The static payload type of PCMU: 0.
+pub const RTP_PT_PCMU = 0
+// The static payload type of GSM: 3.
+pub const RTP_PT_GSM = 3
+// The static payload type of PCMA: 8.
+pub const RTP_PT_PCMA = 8
+// The static payload type of G722: 9.
+pub const RTP_PT_G722 = 9
+// The static payload type of CN, comfort noise: 13.
+pub const RTP_PT_CN = 13
+// The static payload type of JPEG: 26.
+pub const RTP_PT_JPEG = 26
+// The static payload type of H261: 31.
+pub const RTP_PT_H261 = 31
+// The static payload type of MP2T: 33.
+pub const RTP_PT_MP2T = 33
+
+// Whether a payload type is one of the 0 to 95 values, which RFC 3551
+// assigns or reserves, as opposed to a dynamic or an invalid one.
+pub @tier(embedded)
+@no_alloc
+fn pt_is_static(pt: Int) -> Bool []
+    pt >= 0 and pt < RTP_PT_DYNAMIC_FIRST
+
+// Whether a payload type is in the dynamic range, 96 to 127.
+pub @tier(embedded)
+@no_alloc
+fn pt_is_dynamic(pt: Int) -> Bool []
+    pt >= RTP_PT_DYNAMIC_FIRST and pt <= RTP_PT_DYNAMIC_LAST
+
+// The kind of a payload type: one of the `RTP_KIND_` values.
+//
+// A value outside 0 to 127 is `RTP_KIND_UNASSIGNED`.
+//
+// ```novo
+// use rtpstatic
+//
+// fn main() [io]
+//     println("${rtpstatic.pt_kind(0)} ${rtpstatic.pt_kind(26)} ${rtpstatic.pt_kind(33)} ${rtpstatic.pt_kind(73)} ${rtpstatic.pt_kind(111)}")   // 1 2 3 4 5
+// ```
+pub @tier(embedded)
+@no_alloc
+fn pt_kind(pt: Int) -> Int []
+    if pt < 0 or pt > RTP_PT_DYNAMIC_LAST
+        return RTP_KIND_UNASSIGNED
+    if pt >= RTP_PT_DYNAMIC_FIRST
+        return RTP_KIND_DYNAMIC
+    if pt == 33
+        return RTP_KIND_AUDIOVIDEO
+    if pt == 1 or pt == 2 or pt == 19 or pt >= 72 and pt <= 76
+        return RTP_KIND_RESERVED
+    if pt >= 0 and pt <= 18 and pt != 1 and pt != 2
+        return RTP_KIND_AUDIO
+    if pt == 25 or pt == 26 or pt == 28 or pt == 31 or pt == 32 or pt == 34
+        return RTP_KIND_VIDEO
+    RTP_KIND_UNASSIGNED
+
+// The encoding name RFC 3551 gives a static payload type, or "" for one that
+// has none (reserved, unassigned and dynamic types).
+//
+// ```novo
+// use rtpstatic
+//
+// fn main() [io]
+//     println("${rtpstatic.pt_name(0)} ${rtpstatic.pt_name(8)} ${rtpstatic.pt_name(9)} ${rtpstatic.pt_name(96)}")   // PCMU PCMA G722
+// ```
+pub @tier(embedded)
+@no_alloc
+fn pt_name(pt: Int) -> Str []
+    if pt == 0
+        return "PCMU"
+    if pt == 3
+        return "GSM"
+    if pt == 4
+        return "G723"
+    if pt == 5 or pt == 6 or pt == 16 or pt == 17
+        return "DVI4"
+    if pt == 7
+        return "LPC"
+    if pt == 8
+        return "PCMA"
+    if pt == 9
+        return "G722"
+    if pt == 10 or pt == 11
+        return "L16"
+    if pt == 12
+        return "QCELP"
+    if pt == 13
+        return "CN"
+    if pt == 14
+        return "MPA"
+    if pt == 15
+        return "G728"
+    if pt == 18
+        return "G729"
+    if pt == 25
+        return "CelB"
+    if pt == 26
+        return "JPEG"
+    if pt == 28
+        return "nv"
+    if pt == 31
+        return "H261"
+    if pt == 32
+        return "MPV"
+    if pt == 33
+        return "MP2T"
+    if pt == 34
+        return "H263"
+    ""
+
+// The RTP clock rate of a static payload type, in Hz, or -1 for one that has
+// none.
+//
+// The rate is what the timestamp field counts: 8000 for most audio, 90000
+// for all video, and 8000 for G722 although it samples at 16000 Hz.
+pub @tier(embedded)
+@no_alloc
+fn pt_clock(pt: Int) -> Int []
+    if pt_name(pt) == ""
+        return -1
+    if pt == 6
+        return 16000
+    if pt == 10 or pt == 11
+        return 44100
+    if pt == 16
+        return 11025
+    if pt == 17
+        return 22050
+    if pt == 14 or pt >= 25
+        return 90000
+    8000
+
+// The number of channels of a static audio payload type, or 0 for one that
+// is not audio or has no name.  L16 payload type 10 is stereo.
+pub @tier(embedded)
+@no_alloc
+fn pt_channels(pt: Int) -> Int []
+    if pt_kind(pt) != RTP_KIND_AUDIO or pt_name(pt) == ""
+        return 0
+    if pt == 10
+        return 2
+    1
+
+// Whether two bytes of text are the same letter when case is ignored.
+@tier(embedded)
+@no_alloc
+fn same_letter(a: Int, b: Int) -> Bool []
+    if a >= 65 and a <= 90
+        return a + 32 == b or a == b
+    if b >= 65 and b <= 90
+        return b + 32 == a
+    a == b
+
+// Whether two names are the same without regard to case.
+//
+// ```novo
+// use rtpstatic
+//
+// fn main() [io]
+//     println("${rtpstatic.name_eq("pcmu", "PCMU")} ${rtpstatic.name_eq("PCM", "PCMU")}")   // true false
+// ```
+pub @tier(embedded)
+@no_alloc
+fn name_eq(a: Str, b: Str) -> Bool []
+    if str.len(a) != str.len(b)
+        return false
+    for i in 0..str.len(a)
+        if not same_letter(str.byte_at_or(a, i, 0), str.byte_at_or(b, i, 0))
+            return false
+    true
+
+// The static payload type for an encoding name, a clock rate and a channel
+// count, or -1.
+//
+// This is how an `a=rtpmap` line that names a static type is checked.  The
+// channel count 1 is the default: a caller that read none passes 1.
+//
+// ```novo
+// use rtpstatic
+//
+// fn main() [io]
+//     println("${rtpstatic.pt_lookup("PCMU", 8000, 1)} ${rtpstatic.pt_lookup("L16", 44100, 2)} ${rtpstatic.pt_lookup("opus", 48000, 2)}")   // 0 10 -1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn pt_lookup(name: Str, clock: Int, channels: Int) -> Int []
+    for pt in 0..RTP_PT_DYNAMIC_FIRST
+        if name_eq(pt_name(pt), name) and pt_clock(pt) == clock
+            let ch = pt_channels(pt)
+            if ch == channels or ch == 0 and channels == 1
+                return pt
+    -1

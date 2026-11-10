@@ -1,0 +1,261 @@
+// rtcpbuild.nv — writing a compound RTCP packet, one packet after another,
+// into a buffer the caller owns.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  The packets go in the
+// order the caller calls: an SR or an RR starts the compound packet (and
+// empties the buffer), then report blocks, an SDES with its chunks and items,
+// then BYE or APP.  `rtcp_finish` closes the last packet.  Every packet is
+// closed by the call that opens the next, which writes its length in words
+// and its count, so the buffer is only whole after `rtcp_finish`.
+//
+// A step that does not fit empties the buffer and marks the `RtcpBuilder`
+// failed, so a run of calls can be checked once with `b.ok`, or by the answer
+// of `rtcp_finish`.
+//
+// Section 6.1 asks that every compound packet start with a report and carry
+// a CNAME in its SDES; this module does not insist, because a test of a
+// receiver needs to build packets that break the rules.  `rtcpwire.rtcp_check`
+// is the validity check a receiver runs.
+
+use rtcpwire
+use rtpbytes
+
+// The state of a compound packet being built: where the open packet starts,
+// its type and count, where the open SDES chunk starts, and whether every
+// step so far has fitted.
+pub @value
+struct RtcpBuilder
+    // The index of the open packet's header, or -1 when none is open.
+    start: Int
+    // The type of the open packet.
+    pt: Int
+    // Its count field.
+    count: Int
+    // The index of the open SDES chunk's SSRC, or -1.
+    chunk_at: Int
+    // False after a step failed; the buffer was emptied.
+    ok: Bool
+
+// A fresh builder.
+pub @tier(embedded)
+@no_alloc
+fn builder() -> RtcpBuilder []
+    RtcpBuilder { start: -1, pt: 0, count: 0, chunk_at: -1, ok: true }
+
+// Empty the buffer and mark the builder failed.  Answers false.
+@tier(embedded)
+@no_alloc
+fn failed(var m: RtcpPkt, var b: RtcpBuilder) -> Bool []
+    m.clear()
+    b.ok = false
+    b.start = -1
+    b.chunk_at = -1
+    false
+
+// End the open SDES chunk: the item terminator and the zeros to the word.
+@tier(embedded)
+@no_alloc
+fn end_chunk(var m: RtcpPkt, var b: RtcpBuilder) -> Bool []
+    if b.chunk_at < 0
+        return true
+    let fill = 4 - (m.len() - b.chunk_at) % 4
+    b.chunk_at = -1
+    rtpbytes.put_zeros(var m, fill)
+
+// End the open packet: finish a chunk, pad to a whole word, and write the
+// length and the count into the header.  Answers true when none is open.
+@tier(embedded)
+@no_alloc
+fn close_packet(var m: RtcpPkt, var b: RtcpBuilder) -> Bool []
+    if b.start < 0
+        return true
+    var ok = end_chunk(var m, var b)
+    ok = ok and rtpbytes.put_zeros(var m, (4 - m.len() % 4) % 4)
+    // The buffer holds 1500 bytes, so the length in words is far below the
+    // 65535 the header field holds.
+    let words = (m.len() - b.start) / 4 - 1
+    let flags = rtpbytes.get_u8(var m, b.start) & 0xE0
+    let _ = rtpbytes.set_u8(var m, b.start, flags | b.count)
+    let _ = rtpbytes.set_u16(var m, b.start + 2, words)
+    b.start = -1
+    ok
+
+// Start a packet of type `pt` and count `count` after the one that is open.
+@tier(embedded)
+@no_alloc
+fn open_packet(var m: RtcpPkt, var b: RtcpBuilder, pt: Int, count: Int) -> Bool []
+    if not b.ok or not close_packet(var m, var b)
+        return failed(var m, var b)
+    b.start = m.len()
+    b.pt = pt
+    b.count = count
+    if not (rtpbytes.put_u8(var m, RTCP_VERSION << 6) and rtpbytes.put_u8(var m, pt)
+            and rtpbytes.put_u16(var m, 0))
+        return failed(var m, var b)
+    true
+
+// Start a compound packet with a sender report.
+//
+// `ntp_hi` and `ntp_lo` are the two halves of the NTP time the report was
+// made; `rtp_ts` is the same instant in the RTP clock of the media; `packets`
+// and `octets` are the sender's counts.  The buffer is emptied first: an SR
+// begins a compound packet.  Add report blocks with `rtcp_report`, then the
+// SDES.  Answers false, with the buffer emptied, when it does not fit.
+//
+// ```novo
+// use rtcpbuild
+// use rtcpwire
+//
+// fn main() [io]
+//     var m: rtcpwire.RtcpPkt = Vec.new()
+//     var b = rtcpbuild.builder()
+//     let _ = rtcpbuild.rtcp_sr(var m, var b, 0xAA, 1, 2, 3, 4, 5)
+//     let ok = rtcpbuild.rtcp_finish(var m, var b)
+//     println("${ok} ${m.len()} ${rtcpwire.rtcp_check(var m)}")   // true 28 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn rtcp_sr(var m: RtcpPkt, var b: RtcpBuilder, ssrc: Int, ntp_hi: Int, ntp_lo: Int, rtp_ts: Int,
+           packets: Int, octets: Int) -> Bool []
+    m.clear()
+    b.ok = true
+    b.start = -1
+    b.chunk_at = -1
+    // The buffer was just emptied, so the 28 bytes of the packet always fit.
+    let _ = open_packet(var m, var b, RTCP_SR, 0)
+    let _ = rtpbytes.put_u32(var m, ssrc) and rtpbytes.put_u32(var m, ntp_hi)
+        and rtpbytes.put_u32(var m, ntp_lo) and rtpbytes.put_u32(var m, rtp_ts)
+        and rtpbytes.put_u32(var m, packets) and rtpbytes.put_u32(var m, octets)
+    true
+
+// Start a compound packet with a receiver report.  The buffer is emptied
+// first.  An RR with no report blocks is the first packet of a compound that
+// has nothing to report.
+pub @tier(embedded)
+@no_alloc
+fn rtcp_rr(var m: RtcpPkt, var b: RtcpBuilder, ssrc: Int) -> Bool []
+    m.clear()
+    b.ok = true
+    b.start = -1
+    b.chunk_at = -1
+    // The buffer was just emptied, so the eight bytes always fit.
+    let _ = open_packet(var m, var b, RTCP_RR, 0)
+    let _ = rtpbytes.put_u32(var m, ssrc)
+    true
+
+// Append a report block to the open SR or RR.  Answers false, with the buffer
+// emptied, when the open packet is neither, already holds 31 blocks, or the
+// block does not fit.
+pub @tier(embedded)
+@no_alloc
+fn rtcp_report(var m: RtcpPkt, var b: RtcpBuilder, blk: RtcpReportBlock) -> Bool []
+    if not b.ok or b.start < 0 or b.pt != RTCP_SR and b.pt != RTCP_RR or b.count >= RTCP_COUNT_MAX
+        return failed(var m, var b)
+    if not (rtpbytes.put_u32(var m, blk.ssrc)
+            and rtpbytes.put_u8(var m, blk.fraction)
+            and rtpbytes.put_u8(var m, blk.lost >> 16) and rtpbytes.put_u16(var m, blk.lost)
+            and rtpbytes.put_u32(var m, blk.ext_seq) and rtpbytes.put_u32(var m, blk.jitter)
+            and rtpbytes.put_u32(var m, blk.lsr) and rtpbytes.put_u32(var m, blk.dlsr))
+        return failed(var m, var b)
+    b.count = b.count + 1
+    true
+
+// Start an SDES packet.  Add a chunk for each source with `rtcp_sdes_chunk`.
+pub @tier(embedded)
+@no_alloc
+fn rtcp_sdes(var m: RtcpPkt, var b: RtcpBuilder) -> Bool []
+    open_packet(var m, var b, RTCP_SDES, 0)
+
+// Start a chunk of the open SDES packet for the source `ssrc`, ending the
+// chunk before it.  Answers false, with the buffer emptied, when the open
+// packet is not an SDES, it holds 31 chunks, or the chunk does not fit.
+pub @tier(embedded)
+@no_alloc
+fn rtcp_sdes_chunk(var m: RtcpPkt, var b: RtcpBuilder, ssrc: Int) -> Bool []
+    if not b.ok or b.start < 0 or b.pt != RTCP_SDES or b.count >= RTCP_COUNT_MAX
+        return failed(var m, var b)
+    if not end_chunk(var m, var b)
+        return failed(var m, var b)
+    b.chunk_at = m.len()
+    b.count = b.count + 1
+    if not rtpbytes.put_u32(var m, ssrc)
+        return failed(var m, var b)
+    true
+
+// Append an item to the open chunk.  `item` is 1 to 8 (`SDES_CNAME` and the
+// others) and the text is at most 255 bytes.  Answers false, with the buffer
+// emptied, when no chunk is open, the item type or the length is out of range
+// or the item does not fit.
+pub @tier(embedded)
+@no_alloc
+fn rtcp_sdes_item(var m: RtcpPkt, var b: RtcpBuilder, item: Int, text: Str) -> Bool []
+    if not b.ok or b.chunk_at < 0 or item < SDES_CNAME or item > SDES_PRIV or str.len(text) > 255
+        return failed(var m, var b)
+    if not (rtpbytes.put_u8(var m, item) and rtpbytes.put_u8(var m, str.len(text))
+            and rtpbytes.put_str(var m, text))
+        return failed(var m, var b)
+    true
+
+// Append a BYE for one source, with a reason text of up to 255 bytes, or ""
+// for none.
+pub @tier(embedded)
+@no_alloc
+fn rtcp_bye(var m: RtcpPkt, var b: RtcpBuilder, ssrc: Int, reason: Str) -> Bool []
+    if str.len(reason) > 255 or not open_packet(var m, var b, RTCP_BYE, 1)
+        return failed(var m, var b)
+    if not rtpbytes.put_u32(var m, ssrc)
+        return failed(var m, var b)
+    if str.len(reason) > 0
+        if not (rtpbytes.put_u8(var m, str.len(reason)) and rtpbytes.put_str(var m, reason))
+            return failed(var m, var b)
+    true
+
+// Append an APP packet.
+//
+// `subtype` is 0 to 31; `name` is four ASCII characters as one number, first
+// character highest ("ABCD" is 0x41424344); the data are the first `n` bytes
+// of `data`, and `n` must be a multiple of four.
+pub @tier(embedded)
+@no_alloc
+fn rtcp_app(var m: RtcpPkt, var b: RtcpBuilder, subtype: Int, ssrc: Int, name: Int,
+            var data: rtpbytes.RtpSmall, n: Int) -> Bool []
+    if subtype < 0 or subtype > RTCP_COUNT_MAX or n < 0 or n > data.len() or (n & 3) != 0
+        return failed(var m, var b)
+    if not open_packet(var m, var b, RTCP_APP, subtype)
+        return false
+    var ok = rtpbytes.put_u32(var m, ssrc) and rtpbytes.put_u32(var m, name)
+    for i in 0..n
+        ok = ok and rtpbytes.put_u8(var m, data[i] as Int)
+    if not ok
+        return failed(var m, var b)
+    true
+
+// Add `n` bytes of padding to the end of the open packet: the P bit is set,
+// `n - 1` zero bytes are written and then the byte `n`.  `n` is a multiple of
+// four from 4 to 252, because a packet is a whole number of words; a body
+// that is not yet a whole number of words (a BYE with an odd reason) is
+// filled with zeros first.
+pub @tier(embedded)
+@no_alloc
+fn rtcp_pad(var m: RtcpPkt, var b: RtcpBuilder, n: Int) -> Bool []
+    if not b.ok or b.start < 0 or n < 4 or n > 252 or (n & 3) != 0
+        return failed(var m, var b)
+    if not end_chunk(var m, var b)
+        return failed(var m, var b)
+    // The body is brought to a whole word first, then the padding follows.
+    if not (rtpbytes.put_zeros(var m, (4 - (m.len() - b.start) % 4) % 4)
+            and rtpbytes.put_zeros(var m, n - 1) and rtpbytes.put_u8(var m, n))
+        return failed(var m, var b)
+    rtpbytes.set_u8(var m, b.start, rtpbytes.get_u8(var m, b.start) | 0x20)
+
+// End the open packet, and with it the compound packet being built.
+//
+// The length and the count of the last packet are written, so call this
+// before the buffer is sent.  Answers false, with the buffer emptied, when
+// anything failed on the way.
+pub @tier(embedded)
+@no_alloc
+fn rtcp_finish(var m: RtcpPkt, var b: RtcpBuilder) -> Bool []
+    if not b.ok or not close_packet(var m, var b)
+        return failed(var m, var b)
+    true

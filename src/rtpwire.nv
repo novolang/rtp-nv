@@ -1,0 +1,574 @@
+// rtpwire.nv — the RTP data packet of RFC 3550 section 5, with the header
+// extensions of RFC 8285, and no allocation.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  A packet is built
+// into a buffer the caller owns and read in place, so a microphone task, a
+// jitter buffer or a test can build and read one with no heap.
+//
+// THE FORMAT, from section 5.1 of RFC 3550.
+//
+//    0                   1                   2                   3
+//    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+//   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//   |V=2|P|X|  CC   |M|     PT      |       sequence number         |
+//   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//   |                           timestamp                           |
+//   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//   |           synchronization source (SSRC) identifier            |
+//   +=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+
+//   |            contributing source (CSRC) identifiers             |
+//   |                             ....                              |
+//   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//
+// The header is twelve bytes.  CC is the number of 32-bit CSRC identifiers
+// that follow it, 0 to 15.  When X is set a header extension follows the
+// CSRC list: a 16-bit profile-defined value, a 16-bit count of 32-bit words,
+// and that many words.  When P is set the last byte of the packet is a
+// count of padding bytes, itself included, that are not payload.  The
+// payload is everything between the end of the header and the start of the
+// padding.
+//
+// THE HEADER EXTENSION OF RFC 8285.  The profile value 0xBEDE says that the
+// extension holds elements in the one-byte form: each is a byte with the
+// element's ID (1 to 14) in the high four bits and its length minus one in
+// the low four, then 1 to 16 bytes of data.  A zero byte is padding, and an
+// ID of 15 ends the elements.  A profile value of the form 0x100n says the
+// two-byte form: an ID byte (1 to 255), a length byte (0 to 255) and the
+// data; a zero ID byte is a single byte of padding.  The low four bits of
+// the profile value in the two-byte form are application bits.  Any other
+// profile value is an extension this package carries and does not read.
+//
+// WHAT THE PACKAGE DOES NOT DO.  It does not read the payload, it does not
+// decrypt it (SRTP, RFC 3711, is not here), and it does not reorder packets.
+// The sequence number is 16 bits and wraps; `seq_diff` compares two on the
+// circle as RFC 1982 does.
+
+use rtpbytes
+
+// The version in every packet: 2.
+pub const RTP_VERSION = 2
+// The length of the fixed header, in bytes: 12.
+pub const RTP_HEADER_LEN = 12
+// The most CSRC identifiers a packet holds: 15.
+pub const RTP_CSRC_MAX = 15
+// The profile value of the one-byte header extension form: 0xBEDE.
+pub const RTP_EXT_ONE_BYTE = 0xBEDE
+// The profile value of the two-byte form, with no application bits: 0x1000.
+pub const RTP_EXT_TWO_BYTE = 0x1000
+
+// The extension form of a packet with no extension, or of a profile this
+// package does not read: raw words.
+pub const RTP_FORM_RAW = 0
+// The extension is in the one-byte form of RFC 8285 section 4.2.
+pub const RTP_FORM_ONE = 1
+// The extension is in the two-byte form of RFC 8285 section 4.3.
+pub const RTP_FORM_TWO = 2
+
+// A packet parsed without fault.
+pub const RTP_PARSE_OK = 0
+// The packet is shorter than the fixed header.
+pub const RTP_PARSE_TOO_SHORT = 1
+// The version is not 2.
+pub const RTP_PARSE_BAD_VERSION = 2
+// The packet ends inside its CSRC list.
+pub const RTP_PARSE_BAD_CSRC = 3
+// The packet ends inside its header extension.
+pub const RTP_PARSE_BAD_EXTENSION = 4
+// The padding count is zero or larger than the bytes there are for it.
+pub const RTP_PARSE_BAD_PADDING = 5
+
+// A buffer for one packet: the type every function here takes.
+pub alias RtpPkt = rtpbytes.RtpBuf
+
+// What the front of a packet says.
+//
+// `status` is `RTP_PARSE_OK` or the fault; no other field means anything
+// after a fault.  The offsets are indexes into the packet.
+pub @value
+struct RtpHeader
+    // `RTP_PARSE_OK` or one of the faults.
+    status: Int
+    // The marker bit, whose meaning a payload profile defines.
+    marker: Bool
+    // The payload type, 0 to 127.
+    pt: Int
+    // The sequence number, 0 to 65535.
+    seq: Int
+    // The timestamp, 0 to 4294967295, in the payload's clock.
+    timestamp: Int
+    // The synchronization source, 0 to 4294967295.
+    ssrc: Int
+    // How many CSRC identifiers follow the header, 0 to 15.
+    csrc_count: Int
+    // Whether a header extension is present.
+    has_ext: Bool
+    // The 16-bit profile value of the extension, or 0.
+    ext_profile: Int
+    // The index of the first byte of the extension's words, or 0.
+    ext_off: Int
+    // The length of the extension's words in bytes, a multiple of 4, or 0.
+    ext_len: Int
+    // The index of the first payload byte.
+    payload_off: Int
+    // The number of payload bytes, which is 0 for a packet with no payload.
+    payload_len: Int
+    // The number of padding bytes, counting the count byte; 0 for none.
+    pad_len: Int
+    // The length of the packet in bytes.
+    len: Int
+
+// A place in the elements of a header extension: where the walk is, and the
+// element it last found.
+pub @value
+struct RtpExtIter
+    // The index of the next element's first byte.
+    pos: Int
+    // The index at which the extension's words end.
+    end: Int
+    // `RTP_FORM_ONE`, `RTP_FORM_TWO` or `RTP_FORM_RAW`.
+    form: Int
+    // The ID of the element last found, or 0 before the first.
+    id: Int
+    // The index of the first byte of its data.
+    data_off: Int
+    // The length of its data in bytes; -1 after `ext_find` found nothing.
+    data_len: Int
+    // True once the walk met an element that runs past the extension.
+    fault: Bool
+
+// The state of a packet being built: whether a header extension is open and
+// where it starts, and whether every step so far has fitted.
+pub @value
+struct RtpBuilder
+    // The index of the open extension's header, or -1 when none is open.
+    ext_at: Int
+    // The form of the extension: `RTP_FORM_ONE`, `RTP_FORM_TWO` or `RTP_FORM_RAW`.
+    ext_form: Int
+    // True once payload or padding was written; the header is closed.
+    closed: Bool
+    // True once padding was written; nothing may follow it.
+    padded: Bool
+    // False after a step failed; the packet was emptied.
+    ok: Bool
+
+// A fresh builder.
+pub @tier(embedded)
+@no_alloc
+fn builder() -> RtpBuilder []
+    RtpBuilder { ext_at: -1, ext_form: RTP_FORM_RAW, closed: false, padded: false, ok: true }
+
+// The fault header: every field zero, and `status` the fault.
+@tier(embedded)
+@no_alloc
+fn fault(status: Int) -> RtpHeader []
+    RtpHeader { status: status, marker: false, pt: 0, seq: 0, timestamp: 0, ssrc: 0,
+                csrc_count: 0, has_ext: false, ext_profile: 0, ext_off: 0, ext_len: 0,
+                payload_off: 0, payload_len: 0, pad_len: 0, len: 0 }
+
+// Read the front of a packet.
+//
+// The checks are those of section 5.1: the packet holds a header, version 2,
+// the CSRC list it announces, a header extension that ends inside it, and a
+// padding count that is neither zero nor longer than what remains.  A packet
+// that parses has a payload that starts where `payload_off` says.
+//
+// ```novo
+// use rtpwire
+//
+// fn main() [io]
+//     // Version 2, payload type 0, sequence 1, timestamp 160, SSRC 0x1234.
+//     var p: rtpwire.RtpPkt = Vec.new()
+//     var b = rtpwire.builder()
+//     let _ = rtpwire.begin(var p, var b, false, 0, 1, 160, 0x1234)
+//     let _ = rtpwire.push_payload(var p, var b, 0x55)
+//     let h = rtpwire.parse(var p)
+//     println("${h.status} ${h.pt} ${h.seq} ${h.timestamp} ${h.payload_len}")   // 0 0 1 160 1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn parse(var p: RtpPkt) -> RtpHeader []
+    if p.len() < RTP_HEADER_LEN
+        return fault(RTP_PARSE_TOO_SHORT)
+    let b0 = rtpbytes.get_u8(var p, 0)
+    if (b0 >> 6) != RTP_VERSION
+        return fault(RTP_PARSE_BAD_VERSION)
+    let cc = b0 & 15
+    var off = RTP_HEADER_LEN + 4 * cc
+    if off > p.len()
+        return fault(RTP_PARSE_BAD_CSRC)
+    var has_ext = false
+    var ext_profile = 0
+    var ext_off = 0
+    var ext_len = 0
+    if (b0 & 0x10) != 0
+        if off + 4 > p.len()
+            return fault(RTP_PARSE_BAD_EXTENSION)
+        has_ext = true
+        ext_profile = rtpbytes.get_u16(var p, off)
+        ext_off = off + 4
+        ext_len = 4 * rtpbytes.get_u16(var p, off + 2)
+        if ext_off + ext_len > p.len()
+            return fault(RTP_PARSE_BAD_EXTENSION)
+        off = ext_off + ext_len
+    var pad = 0
+    if (b0 & 0x20) != 0
+        pad = rtpbytes.get_u8(var p, p.len() - 1)
+        if pad == 0 or off + pad > p.len()
+            return fault(RTP_PARSE_BAD_PADDING)
+    let b1 = rtpbytes.get_u8(var p, 1)
+    RtpHeader { status: RTP_PARSE_OK, marker: (b1 & 0x80) != 0, pt: b1 & 0x7F,
+                seq: rtpbytes.get_u16(var p, 2), timestamp: rtpbytes.get_u32(var p, 4),
+                ssrc: rtpbytes.get_u32(var p, 8), csrc_count: cc, has_ext: has_ext,
+                ext_profile: ext_profile, ext_off: ext_off, ext_len: ext_len,
+                payload_off: off, payload_len: p.len() - pad - off, pad_len: pad,
+                len: p.len() }
+
+// Whether a header was read without fault.
+pub @tier(embedded)
+@no_alloc
+fn header_ok(h: RtpHeader) -> Bool []
+    h.status == RTP_PARSE_OK
+
+// The `i`th CSRC identifier of a parsed packet, or 0 outside the list.
+pub @tier(embedded)
+@no_alloc
+fn csrc(var p: RtpPkt, h: RtpHeader, i: Int) -> Int []
+    if i < 0 or i >= h.csrc_count
+        return 0
+    rtpbytes.get_u32(var p, RTP_HEADER_LEN + 4 * i)
+
+// Byte `i` of the payload, or -1 outside it.
+pub @tier(embedded)
+@no_alloc
+fn payload_byte(var p: RtpPkt, h: RtpHeader, i: Int) -> Int []
+    if i < 0 or i >= h.payload_len
+        return -1
+    rtpbytes.get_u8(var p, h.payload_off + i)
+
+// The extension form a profile value names.
+//
+// ```novo
+// use rtpwire
+//
+// fn main() [io]
+//     println("${rtpwire.ext_form(0xBEDE)} ${rtpwire.ext_form(0x1003)} ${rtpwire.ext_form(0x1234)}")   // 1 2 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn ext_form(profile: Int) -> Int []
+    if profile == RTP_EXT_ONE_BYTE
+        return RTP_FORM_ONE
+    if (profile & 0xFFF0) == RTP_EXT_TWO_BYTE
+        return RTP_FORM_TWO
+    RTP_FORM_RAW
+
+// An iterator at the first element of the header extension of a parsed
+// packet.  For a packet with no extension, or with a form this package does
+// not read, `ext_next` answers false at once.
+pub @tier(embedded)
+@no_alloc
+fn ext_iter(h: RtpHeader) -> RtpExtIter []
+    var form = RTP_FORM_RAW
+    if h.has_ext
+        form = ext_form(h.ext_profile)
+    RtpExtIter { pos: h.ext_off, end: h.ext_off + h.ext_len, form: form, id: 0, data_off: 0,
+                 data_len: 0, fault: false }
+
+// Move to the next element of the extension and answer whether there was
+// one.
+//
+// After a true answer `id`, `data_off` and `data_len` describe the element.
+// Padding is skipped.  The walk ends, with false, at the end of the words, at
+// the reserved ID 15 of the one-byte form, and at an element that runs past
+// the words, which also sets `fault`.
+//
+// ```novo
+// use rtpbytes
+// use rtpwire
+//
+// fn main() [io]
+//     var p: rtpwire.RtpPkt = Vec.new()
+//     var b = rtpwire.builder()
+//     let _ = rtpwire.begin(var p, var b, false, 111, 7, 0, 1)
+//     let _ = rtpwire.ext_begin(var p, var b, rtpwire.RTP_EXT_ONE_BYTE)
+//     var d: rtpbytes.RtpSmall = Vec.new()
+//     let _ = d.push(0x7F as u8)
+//     let _ = rtpwire.ext_add(var p, var b, 1, var d, 1)
+//     let _ = rtpwire.ext_end(var p, var b)
+//     let h = rtpwire.parse(var p)
+//     var it = rtpwire.ext_iter(h)
+//     let more = rtpwire.ext_next(var p, var it)
+//     println("${more} ${it.id} ${it.data_len} ${rtpbytes.get_u8(var p, it.data_off)}")   // true 1 1 127
+// ```
+pub @tier(embedded)
+@no_alloc
+fn ext_next(var p: RtpPkt, var it: RtpExtIter) -> Bool []
+    if it.form == RTP_FORM_RAW
+        return false
+    for _i in 0..it.end
+        if it.pos >= it.end
+            return false
+        let b = rtpbytes.get_u8(var p, it.pos)
+        if b == 0
+            it.pos = it.pos + 1
+        else if it.form == RTP_FORM_ONE
+            let id = b >> 4
+            if id == 15
+                it.pos = it.end
+                return false
+            let n = (b & 15) + 1
+            if it.pos + 1 + n > it.end
+                it.fault = true
+                it.pos = it.end
+                return false
+            it.id = id
+            it.data_off = it.pos + 1
+            it.data_len = n
+            it.pos = it.pos + 1 + n
+            return true
+        else
+            if it.pos + 2 > it.end
+                it.fault = true
+                it.pos = it.end
+                return false
+            let n = rtpbytes.get_u8(var p, it.pos + 1)
+            if it.pos + 2 + n > it.end
+                it.fault = true
+                it.pos = it.end
+                return false
+            it.id = b
+            it.data_off = it.pos + 2
+            it.data_len = n
+            it.pos = it.pos + 2 + n
+            return true
+    // The loop returns first: every pass advances `pos` by at least one byte
+    // and `end` bounds the passes.
+    // cov: skip — the bounded loop always returns before it is spent
+    false
+
+// The first element of the extension with ID `id`.
+//
+// The iterator answers the element when it was found, with `data_len` of 0
+// or more; when the extension has none, `data_len` is -1.
+pub @tier(embedded)
+@no_alloc
+fn ext_find(var p: RtpPkt, h: RtpHeader, id: Int) -> RtpExtIter []
+    var it = ext_iter(h)
+    for _i in 0..h.ext_len + 1
+        if ext_next(var p, var it)
+            if it.id == id
+                return it
+    RtpExtIter { pos: it.pos, end: it.end, form: it.form, id: 0, data_off: 0, data_len: -1,
+                 fault: it.fault }
+
+// Empty the packet and mark the builder failed.  Answers false.
+@tier(embedded)
+@no_alloc
+fn failed(var p: RtpPkt, var b: RtpBuilder) -> Bool []
+    p.clear()
+    b.ok = false
+    b.ext_at = -1
+    false
+
+// Start a packet: the twelve bytes of the fixed header, replacing what `p`
+// held.
+//
+// `pt` is 0 to 127.  The sequence number and timestamp are held to 16 and 32
+// bits.  Answers false, with `p` empty, when the payload type is out of
+// range.
+pub @tier(embedded)
+@no_alloc
+fn begin(var p: RtpPkt, var b: RtpBuilder, marker: Bool, pt: Int, seq: Int, timestamp: Int,
+         ssrc: Int) -> Bool []
+    p.clear()
+    b.ext_at = -1
+    b.ext_form = RTP_FORM_RAW
+    b.closed = false
+    b.padded = false
+    b.ok = true
+    if pt < 0 or pt > 127
+        return failed(var p, var b)
+    var m = 0
+    if marker
+        m = 0x80
+    let ok = rtpbytes.put_u8(var p, RTP_VERSION << 6) and rtpbytes.put_u8(var p, m | pt)
+        and rtpbytes.put_u16(var p, seq) and rtpbytes.put_u32(var p, timestamp)
+        and rtpbytes.put_u32(var p, ssrc)
+    // Twelve bytes into an empty buffer always fit.
+    ok
+
+// Add a contributing source after the header.
+//
+// CSRC identifiers go before the extension and the payload; the call answers
+// false, with the packet emptied, once either was started or fifteen
+// identifiers are there.
+pub @tier(embedded)
+@no_alloc
+fn add_csrc(var p: RtpPkt, var b: RtpBuilder, csrc: Int) -> Bool []
+    let cc = rtpbytes.get_u8(var p, 0) & 15
+    if not b.ok or b.closed or b.ext_at >= 0 or p.len() != RTP_HEADER_LEN + 4 * cc
+        or cc >= RTP_CSRC_MAX
+        return failed(var p, var b)
+    // At most 72 bytes are there, so four more always fit.
+    let _ = rtpbytes.put_u32(var p, csrc)
+    rtpbytes.set_u8(var p, 0, (RTP_VERSION << 6) | (rtpbytes.get_u8(var p, 0) & 0x30) | (cc + 1))
+
+// Open a header extension with the given profile value.
+//
+// The X bit is set and the extension has no words yet.  Use `ext_add` for
+// each element of the two RFC 8285 forms, or `ext_word` for a raw profile,
+// and close it with `ext_end`.  Answers false, with the packet emptied, when
+// an extension is already there or the payload was started.
+pub @tier(embedded)
+@no_alloc
+fn ext_begin(var p: RtpPkt, var b: RtpBuilder, profile: Int) -> Bool []
+    if not b.ok or b.closed or b.ext_at >= 0 or (rtpbytes.get_u8(var p, 0) & 0x10) != 0
+        return failed(var p, var b)
+    b.ext_at = p.len()
+    b.ext_form = ext_form(profile)
+    let ok = rtpbytes.put_u16(var p, profile) and rtpbytes.put_u16(var p, 0)
+    if not ok
+        return failed(var p, var b)
+    rtpbytes.set_u8(var p, 0, rtpbytes.get_u8(var p, 0) | 0x10)
+
+// Append one element of the open extension.
+//
+// `id` is 1 to 14 and `n` is 1 to 16 in the one-byte form; `id` is 1 to 255
+// and `n` is 0 to 255 in the two-byte form.  The data are the first `n` bytes
+// of `data`.  Answers false, with the packet emptied, when the element does
+// not suit the form or does not fit, and when no extension of those forms is
+// open.
+pub @tier(embedded)
+@no_alloc
+fn ext_add(var p: RtpPkt, var b: RtpBuilder, id: Int, var data: rtpbytes.RtpSmall,
+           n: Int) -> Bool []
+    if not b.ok or b.ext_at < 0 or b.ext_form == RTP_FORM_RAW or n < 0 or n > data.len()
+        return failed(var p, var b)
+    var ok = true
+    if b.ext_form == RTP_FORM_ONE
+        if id < 1 or id > 14 or n < 1 or n > 16
+            return failed(var p, var b)
+        ok = rtpbytes.put_u8(var p, (id << 4) | (n - 1))
+    else
+        if id < 1 or id > 255
+            return failed(var p, var b)
+        ok = rtpbytes.put_u8(var p, id) and rtpbytes.put_u8(var p, n)
+    for i in 0..n
+        ok = ok and rtpbytes.put_u8(var p, data[i] as Int)
+    if not ok
+        return failed(var p, var b)
+    true
+
+// Append one 32-bit word to the open extension: for a profile this package
+// does not read.
+pub @tier(embedded)
+@no_alloc
+fn ext_word(var p: RtpPkt, var b: RtpBuilder, v: Int) -> Bool []
+    if not b.ok or b.ext_at < 0 or not rtpbytes.put_u32(var p, v)
+        return failed(var p, var b)
+    true
+
+// Close the open extension: pad it with zero bytes to a multiple of four
+// and write its length in words.
+//
+// Answers false, with the packet emptied, when none is open or the padding
+// does not fit.
+pub @tier(embedded)
+@no_alloc
+fn ext_end(var p: RtpPkt, var b: RtpBuilder) -> Bool []
+    if not b.ok or b.ext_at < 0
+        return failed(var p, var b)
+    let used = p.len() - (b.ext_at + 4)
+    let padded = (used + 3) / 4 * 4
+    // The words start on a word boundary and the buffer is a whole number of
+    // words, so the padding always fits, and 1484 bytes of words is far below
+    // the 65535 words the length field holds.
+    let _ = rtpbytes.put_zeros(var p, padded - used)
+    let _ = rtpbytes.set_u16(var p, b.ext_at + 2, padded / 4)
+    b.ext_at = -1
+    true
+
+// Append one byte of payload.  The header is closed by the first one.
+// Answers false, with the packet emptied, when the packet is full or an
+// extension is still open.
+pub @tier(embedded)
+@no_alloc
+fn push_payload(var p: RtpPkt, var b: RtpBuilder, v: Int) -> Bool []
+    if not b.ok or b.padded or b.ext_at >= 0 or not rtpbytes.put_u8(var p, v)
+        return failed(var p, var b)
+    b.closed = true
+    true
+
+// Append the bytes of a string as payload.
+pub @tier(embedded)
+@no_alloc
+fn push_payload_str(var p: RtpPkt, var b: RtpBuilder, s: Str) -> Bool []
+    var ok = true
+    for i in 0..str.len(s)
+        ok = ok and push_payload(var p, var b, str.byte_at_or(s, i, 0))
+    ok
+
+// Append `n` bytes of `src`, starting at `from`, as payload: a frame cut out
+// of a larger buffer.  Answers false, with the packet emptied, when the range
+// is outside `src` or the bytes do not fit.
+pub @tier(embedded)
+@no_alloc
+fn push_payload_from(var p: RtpPkt, var b: RtpBuilder, var src: rtpbytes.RtpBuf, from: Int,
+                     n: Int) -> Bool []
+    if from < 0 or n < 0 or from + n > src.len()
+        return failed(var p, var b)
+    var ok = true
+    for i in 0..n
+        ok = ok and push_payload(var p, var b, src[from + i] as Int)
+    ok
+
+// Pad the packet to carry `n` bytes of padding, counting the count byte.
+//
+// `n` is 1 to 255.  The P bit is set, `n - 1` zero bytes are written and
+// then the byte `n`; nothing may follow.  Answers false, with the packet
+// emptied, when `n` is out of range or does not fit.
+pub @tier(embedded)
+@no_alloc
+fn add_padding(var p: RtpPkt, var b: RtpBuilder, n: Int) -> Bool []
+    if not b.ok or b.padded or b.ext_at >= 0 or n < 1 or n > 255
+        return failed(var p, var b)
+    if not rtpbytes.put_zeros(var p, n - 1) or not rtpbytes.put_u8(var p, n)
+        return failed(var p, var b)
+    b.closed = true
+    b.padded = true
+    rtpbytes.set_u8(var p, 0, rtpbytes.get_u8(var p, 0) | 0x20)
+
+// The sequence number after `seq`: one more, and 0 after 65535.
+pub @tier(embedded)
+@no_alloc
+fn next_seq(seq: Int) -> Int []
+    (seq + 1) & 0xFFFF
+
+// The signed distance from `b` to `a` on the circle of 16-bit sequence
+// numbers, from -32768 to 32767: positive when `a` is ahead of `b`.
+//
+// ```novo
+// use rtpwire
+//
+// fn main() [io]
+//     println("${rtpwire.seq_diff(2, 65534)} ${rtpwire.seq_diff(65534, 2)}")   // 4 -4
+// ```
+pub @tier(embedded)
+@no_alloc
+fn seq_diff(a: Int, b: Int) -> Int []
+    let d = (a - b) & 0xFFFF
+    if d >= 0x8000
+        return d - 0x10000
+    d
+
+// Whether sequence number `a` is ahead of `b` on the circle.
+pub @tier(embedded)
+@no_alloc
+fn seq_newer(a: Int, b: Int) -> Bool []
+    seq_diff(a, b) > 0
+
+// The timestamp after adding `ticks`, modulo 2^32.
+pub @tier(embedded)
+@no_alloc
+fn ts_add(ts: Int, ticks: Int) -> Int []
+    rtpbytes.wrap32(ts + ticks)

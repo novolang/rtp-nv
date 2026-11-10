@@ -1,0 +1,144 @@
+// rtpbytes.nv — the big-endian reads and writes that RTP and RTCP are made
+// of, over a buffer the caller owns.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  Every field of
+// RFC 3550 is an unsigned integer in network byte order: 16 bits for a
+// sequence number, 32 for a timestamp, an SSRC or half of an NTP time.
+// A 32-bit field is held in an `Int`, which is 64 bits on every target, so
+// a value from 0 to 4294967295 needs no sign handling; the arithmetic that
+// wraps at 2^32 masks with `U32` where the RFC says "modulo 2^32".
+//
+// A read past the end of the buffer answers 0 and a write past the capacity
+// answers false.  The parsers in `rtpwire` and `rtcpwire` check a length
+// before they read, so the 0 is a guard and never an answer they use.
+
+// The capacity of the buffer every packet in this package is held in, in
+// bytes: 1500, an Ethernet MTU.  A UDP datagram that carries RTP over IPv4
+// or IPv6 on such a link is smaller still.
+pub const RTP_BUF_MAX = 1500
+
+// The mask of an unsigned 32-bit value: 0xFFFFFFFF.
+pub const U32 = 0xFFFFFFFF
+
+// A buffer for one RTP packet or one RTCP compound packet: the type every
+// function in this package takes.
+pub alias RtpBuf = Vec[u8; RTP_BUF_MAX]
+
+// A small buffer for the data of a header extension element or of an APP
+// packet: 256 bytes.
+pub alias RtpSmall = Vec[u8; 256]
+
+// Byte `i` of the buffer, or 0 outside it.
+//
+// ```novo
+// use rtpbytes
+//
+// fn main() [io]
+//     var m: rtpbytes.RtpBuf = Vec.new()
+//     let _ = rtpbytes.put_u16(var m, 0xBEDE)
+//     println("${rtpbytes.get_u8(var m, 0)} ${rtpbytes.get_u8(var m, 5)}")   // 190 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn get_u8(var m: RtpBuf, i: Int) -> Int []
+    if i < 0 or i >= m.len()
+        return 0
+    m[i] as Int
+
+// The 16-bit big-endian value at `i`, or 0 when it does not lie inside the
+// buffer.
+pub @tier(embedded)
+@no_alloc
+fn get_u16(var m: RtpBuf, i: Int) -> Int []
+    if i < 0 or i + 2 > m.len()
+        return 0
+    (m[i] as Int << 8) | m[i + 1] as Int
+
+// The 32-bit big-endian value at `i`, or 0 when it does not lie inside the
+// buffer.
+pub @tier(embedded)
+@no_alloc
+fn get_u32(var m: RtpBuf, i: Int) -> Int []
+    if i < 0 or i + 4 > m.len()
+        return 0
+    (m[i] as Int << 24) | (m[i + 1] as Int << 16) | (m[i + 2] as Int << 8) | m[i + 3] as Int
+
+// Append one byte; only the low eight bits of `v` are written.  Answers
+// false when the buffer is full.
+pub @tier(embedded)
+@no_alloc
+fn put_u8(var m: RtpBuf, v: Int) -> Bool []
+    match m.push((v & 0xFF) as u8)
+        Ok(_)  => true
+        Err(_) => false
+
+// Append a 16-bit value, high byte first.  Answers false when it does not
+// fit.
+pub @tier(embedded)
+@no_alloc
+fn put_u16(var m: RtpBuf, v: Int) -> Bool []
+    put_u8(var m, v >> 8) and put_u8(var m, v)
+
+// Append a 32-bit value, high byte first.  Answers false when it does not
+// fit; the bytes that fitted stay, so a caller that cares empties the
+// buffer.
+pub @tier(embedded)
+@no_alloc
+fn put_u32(var m: RtpBuf, v: Int) -> Bool []
+    put_u8(var m, v >> 24) and put_u8(var m, v >> 16) and put_u8(var m, v >> 8) and put_u8(var m, v)
+
+// Overwrite the 16-bit value at `i`.  Answers false, and writes nothing,
+// when the two bytes are not both inside the buffer.
+pub @tier(embedded)
+@no_alloc
+fn set_u16(var m: RtpBuf, i: Int, v: Int) -> Bool []
+    if i < 0 or i + 2 > m.len()
+        return false
+    m[i] = ((v >> 8) & 0xFF) as u8
+    m[i + 1] = (v & 0xFF) as u8
+    true
+
+// Overwrite the byte at `i`.  Answers false when `i` is outside.
+pub @tier(embedded)
+@no_alloc
+fn set_u8(var m: RtpBuf, i: Int, v: Int) -> Bool []
+    if i < 0 or i >= m.len()
+        return false
+    m[i] = (v & 0xFF) as u8
+    true
+
+// The bytes of a string appended to the buffer.  Answers false when they do
+// not fit.
+pub @tier(embedded)
+@no_alloc
+fn put_str(var m: RtpBuf, s: Str) -> Bool []
+    var ok = true
+    for i in 0..str.len(s)
+        ok = ok and put_u8(var m, str.byte_at_or(s, i, 0))
+    ok
+
+// `n` zero bytes appended.  Answers false when they do not fit.
+pub @tier(embedded)
+@no_alloc
+fn put_zeros(var m: RtpBuf, n: Int) -> Bool []
+    var ok = true
+    for _i in 0..n
+        ok = ok and put_u8(var m, 0)
+    ok
+
+// Whether the `n` bytes at `from` equal the bytes of `s`.
+pub @tier(embedded)
+@no_alloc
+fn eq_str(var m: RtpBuf, from: Int, n: Int, s: Str) -> Bool []
+    if n != str.len(s) or from < 0 or from + n > m.len()
+        return false
+    for i in 0..n
+        if (m[from + i] as Int) != str.byte_at_or(s, i, 0)
+            return false
+    true
+
+// `v` modulo 2^32.
+pub @tier(embedded)
+@no_alloc
+fn wrap32(v: Int) -> Int []
+    v & U32

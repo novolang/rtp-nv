@@ -1,0 +1,490 @@
+// rtpwire_tests.nv — the RTP packet, byte by byte.
+//
+// THE VECTORS ARE DERIVED BY HAND from section 5.1 of RFC 3550 and from
+// RFC 8285, not recorded from this code.  The first byte of a packet is
+// V(2 bits) P X CC(4 bits): version 2 is 0b10 in the high bits, so a packet
+// with no padding, no extension and no CSRC starts 0x80; P is 0x20, X is
+// 0x10 and the CC is the low nibble.  The second byte is M(1 bit) PT(7
+// bits): payload type 0 with the marker clear is 0x00, payload type 96 with
+// the marker set is 0x80 + 96 = 0xE0.  Each other vector is worked out in the
+// comment above it.
+
+use std.test
+use rtpbytes
+use rtpwire
+
+// A packet from a list of byte values.
+fn pkt_of(xs: [Int]) -> rtpwire.RtpPkt
+    var p: rtpwire.RtpPkt = Vec.new()
+    for x in xs
+        let _ = p.push(x as u8)
+    p
+
+// The index of the first byte of the packet that differs from the expected
+// list, -2 when the lengths differ, and -1 when they agree.
+fn diff(var p: rtpwire.RtpPkt, want: [Int]) -> Int
+    if p.len() != list.len(want)
+        return -2
+    for i in 0..p.len()
+        if (p[i] as Int) != want[i]
+            return i
+    -1
+
+// A packet of `n` bytes, to leave a chosen room.
+fn filled(n: Int) -> rtpwire.RtpPkt
+    var p: rtpwire.RtpPkt = Vec.new()
+    for _i in 0..n
+        let _ = p.push(0 as u8)
+    p
+
+@test
+fn test_a_plain_packet_is_twelve_bytes_and_a_payload() [io]
+    // PCMU (payload type 0), sequence 1000 = 0x03E8, timestamp 160 = 0xA0,
+    // SSRC 0xDEADBEEF, then the payload bytes AA BB.
+    test.case("the bytes are the header and the payload")
+    var p: rtpwire.RtpPkt = Vec.new()
+    var b = rtpwire.builder()
+    test.assert(rtpwire.begin(var p, var b, false, 0, 1000, 160, 0xDEADBEEF))
+    test.assert(rtpwire.push_payload(var p, var b, 0xAA))
+    test.assert(rtpwire.push_payload(var p, var b, 0xBB))
+    test.assert_eq(diff(var p, [0x80, 0x00, 0x03, 0xE8, 0x00, 0x00, 0x00, 0xA0, 0xDE, 0xAD,
+                                0xBE, 0xEF, 0xAA, 0xBB]),
+                                -1)
+
+    test.case("it parses to what was built")
+    let h = rtpwire.parse(var p)
+    test.assert(rtpwire.header_ok(h))
+    test.assert(not h.marker)
+    test.assert_eq(h.pt, 0)
+    test.assert_eq(h.seq, 1000)
+    test.assert_eq(h.timestamp, 160)
+    test.assert_eq(h.ssrc, 0xDEADBEEF)
+    test.assert_eq(h.csrc_count, 0)
+    test.assert(not h.has_ext)
+    test.assert_eq(h.payload_off, 12)
+    test.assert_eq(h.payload_len, 2)
+    test.assert_eq(h.pad_len, 0)
+    test.assert_eq(h.len, 14)
+    test.assert_eq(rtpwire.payload_byte(var p, h, 1), 0xBB)
+    test.assert_eq(rtpwire.payload_byte(var p, h, 2), -1)
+    test.assert_eq(rtpwire.payload_byte(var p, h, -1), -1)
+
+@test
+fn test_marker_csrc_and_a_string_payload() [io]
+    // Marker set, payload type 96: byte 1 is 0x80 + 96 = 0xE0.  Two CSRCs
+    // make the first byte 0x80 | 2 = 0x82.  The payload "hi" is 68 69.
+    test.case("two CSRCs, the marker and a dynamic type")
+    var p: rtpwire.RtpPkt = Vec.new()
+    var b = rtpwire.builder()
+    test.assert(rtpwire.begin(var p, var b, true, 96, 65535, 0xFFFFFFFF, 1))
+    test.assert(rtpwire.add_csrc(var p, var b, 0x11111111))
+    test.assert(rtpwire.add_csrc(var p, var b, 0x22222222))
+    test.assert(rtpwire.push_payload_str(var p, var b, "hi"))
+    test.assert_eq(diff(var p, [0x82, 0xE0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00,
+                                0x00, 0x01, 0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x22, 0x22,
+                                0x68, 0x69]),
+                                -1)
+    let h = rtpwire.parse(var p)
+    test.assert(h.marker)
+    test.assert_eq(h.pt, 96)
+    test.assert_eq(h.csrc_count, 2)
+    test.assert_eq(rtpwire.csrc(var p, h, 0), 0x11111111)
+    test.assert_eq(rtpwire.csrc(var p, h, 1), 0x22222222)
+    test.assert_eq(rtpwire.csrc(var p, h, 2), 0)
+    test.assert_eq(rtpwire.csrc(var p, h, -1), 0)
+    test.assert_eq(h.payload_off, 20)
+    test.assert_eq(h.payload_len, 2)
+
+@test
+fn test_payload_copied_from_another_buffer() [io]
+    var src = pkt_of([1, 2, 3, 4, 5])
+    var p: rtpwire.RtpPkt = Vec.new()
+    var b = rtpwire.builder()
+    let _ = rtpwire.begin(var p, var b, false, 8, 1, 2, 3)
+    test.case("a range of the source becomes the payload")
+    test.assert(rtpwire.push_payload_from(var p, var b, var src, 1, 3))
+    let h = rtpwire.parse(var p)
+    test.assert_eq(h.payload_len, 3)
+    test.assert_eq(rtpwire.payload_byte(var p, h, 0), 2)
+    test.assert_eq(rtpwire.payload_byte(var p, h, 2), 4)
+    test.case("a range outside the source is refused")
+    test.assert(not rtpwire.push_payload_from(var p, var b, var src, 3, 3))
+    test.assert_eq(p.len(), 0)
+    test.assert(not b.ok)
+    let _ = rtpwire.begin(var p, var b, false, 8, 1, 2, 3)
+    test.assert(not rtpwire.push_payload_from(var p, var b, var src, -1, 2))
+    let _ = rtpwire.begin(var p, var b, false, 8, 1, 2, 3)
+    test.assert(not rtpwire.push_payload_from(var p, var b, var src, 0, -1))
+
+@test
+fn test_padding_is_not_payload() [io]
+    // Three payload bytes, then four bytes of padding: 00 00 00 04.  The P
+    // bit makes the first byte 0x80 | 0x20 = 0xA0.
+    test.case("the padding count ends the packet")
+    var p: rtpwire.RtpPkt = Vec.new()
+    var b = rtpwire.builder()
+    let _ = rtpwire.begin(var p, var b, false, 0, 1, 0, 9)
+    test.assert(rtpwire.push_payload_str(var p, var b, "abc"))
+    test.assert(rtpwire.add_padding(var p, var b, 4))
+    test.assert_eq(diff(var p, [0xA0, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                0x00, 0x09, 0x61, 0x62, 0x63, 0x00, 0x00, 0x00, 0x04]),
+                                -1)
+    let h = rtpwire.parse(var p)
+    test.assert(rtpwire.header_ok(h))
+    test.assert_eq(h.payload_len, 3)
+    test.assert_eq(h.pad_len, 4)
+    test.assert_eq(h.len, 19)
+
+    test.case("a padding of one is the count byte alone")
+    var q: rtpwire.RtpPkt = Vec.new()
+    let _ = rtpwire.begin(var q, var b, false, 0, 1, 0, 9)
+    test.assert(rtpwire.add_padding(var q, var b, 1))
+    test.assert_eq(rtpwire.parse(var q).payload_len, 0)
+    test.assert_eq(rtpwire.parse(var q).pad_len, 1)
+
+    test.case("nothing follows padding, and the range is 1 to 255")
+    test.assert(not rtpwire.push_payload(var q, var b, 1))
+    let _ = rtpwire.begin(var q, var b, false, 0, 1, 0, 9)
+    test.assert(not rtpwire.add_padding(var q, var b, 0))
+    let _ = rtpwire.begin(var q, var b, false, 0, 1, 0, 9)
+    test.assert(not rtpwire.add_padding(var q, var b, 256))
+    let _ = rtpwire.begin(var q, var b, false, 0, 1, 0, 9)
+    let _ = rtpwire.ext_begin(var q, var b, 0x1234)
+    test.assert(not rtpwire.add_padding(var q, var b, 4))
+
+@test
+fn test_the_one_byte_extension_of_rfc_8285() [io]
+    // Element 1 carries one byte 0x7F: byte 0x10 (ID 1, length-1 = 0), then
+    // 7F.  Element 3 carries three bytes 01 02 03: byte 0x32 (ID 3, length-1
+    // = 2).  Together 2 + 4 = 6 bytes, padded with two zeros to 8: two
+    // words.  The profile is BE DE and the length field is 00 02.
+    test.case("the extension bytes follow the header")
+    var p: rtpwire.RtpPkt = Vec.new()
+    var b = rtpwire.builder()
+    let _ = rtpwire.begin(var p, var b, false, 111, 7, 0, 1)
+    test.assert(rtpwire.ext_begin(var p, var b, rtpwire.RTP_EXT_ONE_BYTE))
+    var d: rtpbytes.RtpSmall = Vec.new()
+    let _ = d.push(0x7F as u8)
+    test.assert(rtpwire.ext_add(var p, var b, 1, var d, 1))
+    d.clear()
+    let _ = d.push(1 as u8)
+    let _ = d.push(2 as u8)
+    let _ = d.push(3 as u8)
+    test.assert(rtpwire.ext_add(var p, var b, 3, var d, 3))
+    test.assert(rtpwire.ext_end(var p, var b))
+    test.assert(rtpwire.push_payload(var p, var b, 0xEE))
+    test.assert_eq(diff(var p, [0x90, 0x6F, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                0x00, 0x01, 0xBE, 0xDE, 0x00, 0x02, 0x10, 0x7F, 0x32, 0x01,
+                                0x02, 0x03, 0x00, 0x00, 0xEE]),
+                                -1)
+
+    test.case("the iterator finds both and the payload starts after the words")
+    let h = rtpwire.parse(var p)
+    test.assert(rtpwire.header_ok(h))
+    test.assert(h.has_ext)
+    test.assert_eq(h.ext_profile, 0xBEDE)
+    test.assert_eq(h.ext_off, 16)
+    test.assert_eq(h.ext_len, 8)
+    test.assert_eq(h.payload_off, 24)
+    test.assert_eq(rtpwire.ext_form(h.ext_profile), rtpwire.RTP_FORM_ONE)
+    var it = rtpwire.ext_iter(h)
+    test.assert(rtpwire.ext_next(var p, var it))
+    test.assert_eq(it.id, 1)
+    test.assert_eq(it.data_len, 1)
+    test.assert_eq(rtpbytes.get_u8(var p, it.data_off), 0x7F)
+    test.assert(rtpwire.ext_next(var p, var it))
+    test.assert_eq(it.id, 3)
+    test.assert_eq(it.data_len, 3)
+    test.assert(not rtpwire.ext_next(var p, var it))
+    test.assert(not it.fault)
+
+    test.case("ext_find answers the element or -1")
+    let f = rtpwire.ext_find(var p, h, 3)
+    test.assert_eq(f.data_len, 3)
+    test.assert_eq(rtpbytes.get_u8(var p, f.data_off + 2), 3)
+    test.assert_eq(rtpwire.ext_find(var p, h, 9).data_len, -1)
+
+@test
+fn test_the_two_byte_extension_of_rfc_8285() [io]
+    // Profile 0x1000, element ID 5 with no data (05 00), element ID 200 with
+    // two bytes AA BB (C8 02 AA BB): 2 + 4 = 6 bytes, padded to 8.
+    test.case("the bytes of both elements")
+    var p: rtpwire.RtpPkt = Vec.new()
+    var b = rtpwire.builder()
+    let _ = rtpwire.begin(var p, var b, false, 0, 1, 0, 1)
+    test.assert(rtpwire.ext_begin(var p, var b, rtpwire.RTP_EXT_TWO_BYTE))
+    var d: rtpbytes.RtpSmall = Vec.new()
+    test.assert(rtpwire.ext_add(var p, var b, 5, var d, 0))
+    let _ = d.push(0xAA as u8)
+    let _ = d.push(0xBB as u8)
+    test.assert(rtpwire.ext_add(var p, var b, 200, var d, 2))
+    test.assert(rtpwire.ext_end(var p, var b))
+    test.assert_eq(diff(var p, [0x90, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                0x00, 0x01, 0x10, 0x00, 0x00, 0x02, 0x05, 0x00, 0xC8, 0x02,
+                                0xAA, 0xBB, 0x00, 0x00]),
+                                -1)
+    let h = rtpwire.parse(var p)
+    test.assert_eq(h.payload_len, 0)
+    test.assert_eq(rtpwire.ext_form(h.ext_profile), rtpwire.RTP_FORM_TWO)
+    var it = rtpwire.ext_iter(h)
+    test.assert(rtpwire.ext_next(var p, var it))
+    test.assert_eq(it.id, 5)
+    test.assert_eq(it.data_len, 0)
+    test.assert(rtpwire.ext_next(var p, var it))
+    test.assert_eq(it.id, 200)
+    test.assert_eq(it.data_len, 2)
+    test.assert(not rtpwire.ext_next(var p, var it))
+
+    test.case("application bits in the low nibble of the profile are accepted")
+    test.assert_eq(rtpwire.ext_form(0x1007), rtpwire.RTP_FORM_TWO)
+    test.assert_eq(rtpwire.ext_form(0x1100), rtpwire.RTP_FORM_RAW)
+
+@test
+fn test_extension_walks_skip_padding_and_stop_at_id_15() [io]
+    // Words: 00 10 AA 00 00 F1 99 99 -- padding, element 1 (one byte AA),
+    // two bytes of padding, then 0xF1: ID 15 ends the elements, whatever
+    // follows.
+    test.case("padding between elements is skipped and ID 15 ends the walk")
+    var p = pkt_of([0x90, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 1, 0xBE, 0xDE, 0x00, 0x02,
+                    0x00, 0x10, 0xAA, 0x00, 0x00, 0xF1, 0x99, 0x99])
+    let h = rtpwire.parse(var p)
+    var it = rtpwire.ext_iter(h)
+    test.assert(rtpwire.ext_next(var p, var it))
+    test.assert_eq(it.id, 1)
+    test.assert(not rtpwire.ext_next(var p, var it))
+    test.assert(not it.fault)
+    test.assert(not rtpwire.ext_next(var p, var it))
+
+    test.case("a two-byte walk skips single bytes of padding")
+    var q = pkt_of([0x90, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 1, 0x10, 0x00, 0x00, 0x01,
+                    0x00, 0x00, 0x09, 0x00])
+    let hq = rtpwire.parse(var q)
+    var iq = rtpwire.ext_iter(hq)
+    test.assert(rtpwire.ext_next(var q, var iq))
+    test.assert_eq(iq.id, 9)
+    test.assert_eq(iq.data_len, 0)
+
+    test.case("an element that runs past the words is a fault")
+    // One-byte: 0x13 says four bytes follow but only two words are there.
+    var r = pkt_of([0x90, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 1, 0xBE, 0xDE, 0x00, 0x01,
+                    0x13, 0x01, 0x02, 0x03])
+    let hr = rtpwire.parse(var r)
+    var ir = rtpwire.ext_iter(hr)
+    test.assert(not rtpwire.ext_next(var r, var ir))
+    test.assert(ir.fault)
+    // Two-byte: the length byte is missing (the id byte is the last byte).
+    var s = pkt_of([0x90, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 1, 0x10, 0x00, 0x00, 0x01,
+                    0x00, 0x00, 0x00, 0x07])
+    let hs = rtpwire.parse(var s)
+    var is = rtpwire.ext_iter(hs)
+    test.assert(not rtpwire.ext_next(var s, var is))
+    test.assert(is.fault)
+    // Two-byte: the length byte says three and one remains.
+    var t = pkt_of([0x90, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 1, 0x10, 0x00, 0x00, 0x01,
+                    0x00, 0x00, 0x07, 0x03])
+    let ht = rtpwire.parse(var t)
+    var it2 = rtpwire.ext_iter(ht)
+    test.assert(not rtpwire.ext_next(var t, var it2))
+    test.assert(it2.fault)
+
+    test.case("a raw profile and a packet without an extension have no elements")
+    var u = pkt_of([0x90, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 1, 0x12, 0x34, 0x00, 0x01,
+                    0xDE, 0xAD, 0xBE, 0xEF])
+    let hu = rtpwire.parse(var u)
+    var iu = rtpwire.ext_iter(hu)
+    test.assert(not rtpwire.ext_next(var u, var iu))
+    test.assert(not iu.fault)
+    var v = pkt_of([0x80, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 1])
+    var iv = rtpwire.ext_iter(rtpwire.parse(var v))
+    test.assert(not rtpwire.ext_next(var v, var iv))
+
+@test
+fn test_a_raw_extension_is_words_the_package_carries() [io]
+    var p: rtpwire.RtpPkt = Vec.new()
+    var b = rtpwire.builder()
+    let _ = rtpwire.begin(var p, var b, false, 0, 1, 0, 1)
+    test.assert(rtpwire.ext_begin(var p, var b, 0x1234))
+    test.assert(rtpwire.ext_word(var p, var b, 0xCAFEBABE))
+    test.assert(rtpwire.ext_end(var p, var b))
+    test.assert_eq(diff(var p, [0x90, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 1, 0x12, 0x34,
+                                0x00, 0x01, 0xCA, 0xFE, 0xBA, 0xBE]),
+                                -1)
+    test.case("elements cannot be added to a raw extension")
+    var d: rtpbytes.RtpSmall = Vec.new()
+    let _ = d.push(1 as u8)
+    let _ = rtpwire.begin(var p, var b, false, 0, 1, 0, 1)
+    let _ = rtpwire.ext_begin(var p, var b, 0x1234)
+    test.assert(not rtpwire.ext_add(var p, var b, 1, var d, 1))
+    test.case("a word needs an open extension")
+    let _ = rtpwire.begin(var p, var b, false, 0, 1, 0, 1)
+    test.assert(not rtpwire.ext_word(var p, var b, 1))
+
+@test
+fn test_parse_faults() [io]
+    test.case("shorter than the header")
+    var a = pkt_of([0x80, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0])
+    test.assert_eq(rtpwire.parse(var a).status, rtpwire.RTP_PARSE_TOO_SHORT)
+    test.case("version 1 is refused")
+    var b = pkt_of([0x40, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 1])
+    test.assert_eq(rtpwire.parse(var b).status, rtpwire.RTP_PARSE_BAD_VERSION)
+    test.case("a CSRC list that runs past the packet")
+    var c = pkt_of([0x82, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1])
+    test.assert_eq(rtpwire.parse(var c).status, rtpwire.RTP_PARSE_BAD_CSRC)
+    test.case("an extension header cut off")
+    var d = pkt_of([0x90, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 1, 0xBE, 0xDE])
+    test.assert_eq(rtpwire.parse(var d).status, rtpwire.RTP_PARSE_BAD_EXTENSION)
+    test.case("an extension whose words run past the packet")
+    var e = pkt_of([0x90, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 1, 0xBE, 0xDE, 0x00, 0x02,
+                    0, 0, 0, 0])
+    test.assert_eq(rtpwire.parse(var e).status, rtpwire.RTP_PARSE_BAD_EXTENSION)
+    test.case("a padding count of zero")
+    var f = pkt_of([0xA0, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 1, 0x61, 0x00])
+    test.assert_eq(rtpwire.parse(var f).status, rtpwire.RTP_PARSE_BAD_PADDING)
+    test.case("a padding count larger than what follows the header")
+    var g = pkt_of([0xA0, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 1, 0x61, 0x05])
+    test.assert_eq(rtpwire.parse(var g).status, rtpwire.RTP_PARSE_BAD_PADDING)
+    test.assert(not rtpwire.header_ok(rtpwire.parse(var g)))
+    test.case("a padding count that exactly fills the rest is allowed")
+    var h = pkt_of([0xA0, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 1, 0x00, 0x02])
+    test.assert_eq(rtpwire.parse(var h).status, rtpwire.RTP_PARSE_OK)
+    test.assert_eq(rtpwire.parse(var h).payload_len, 0)
+
+@test
+fn test_builder_refusals() [io]
+    var p: rtpwire.RtpPkt = Vec.new()
+    var b = rtpwire.builder()
+    test.case("a payload type above 127")
+    test.assert(not rtpwire.begin(var p, var b, false, 128, 1, 0, 1))
+    test.assert(not b.ok)
+    test.assert_eq(p.len(), 0)
+    test.assert(not rtpwire.begin(var p, var b, false, -1, 1, 0, 1))
+    test.case("begin restores a failed builder")
+    test.assert(rtpwire.begin(var p, var b, false, 127, 1, 0, 1))
+    test.assert(b.ok)
+    test.case("the sixteenth CSRC")
+    for i in 0..15
+        test.assert(rtpwire.add_csrc(var p, var b, i))
+    test.assert(not rtpwire.add_csrc(var p, var b, 15))
+    test.assert_eq(p.len(), 0)
+    test.case("a CSRC after the payload or after an extension")
+    let _ = rtpwire.begin(var p, var b, false, 0, 1, 0, 1)
+    let _ = rtpwire.push_payload(var p, var b, 1)
+    test.assert(not rtpwire.add_csrc(var p, var b, 1))
+    let _ = rtpwire.begin(var p, var b, false, 0, 1, 0, 1)
+    let _ = rtpwire.ext_begin(var p, var b, 0xBEDE)
+    test.assert(not rtpwire.add_csrc(var p, var b, 1))
+    let _ = rtpwire.begin(var p, var b, false, 0, 1, 0, 1)
+    let _ = rtpwire.ext_begin(var p, var b, 0xBEDE)
+    let _ = rtpwire.ext_end(var p, var b)
+    test.assert(not rtpwire.add_csrc(var p, var b, 1))
+    test.case("a second extension")
+    let _ = rtpwire.begin(var p, var b, false, 0, 1, 0, 1)
+    test.assert(rtpwire.ext_begin(var p, var b, 0xBEDE))
+    test.assert(not rtpwire.ext_begin(var p, var b, 0xBEDE))
+    let _ = rtpwire.begin(var p, var b, false, 0, 1, 0, 1)
+    let _ = rtpwire.ext_begin(var p, var b, 0xBEDE)
+    let _ = rtpwire.ext_end(var p, var b)
+    test.assert(not rtpwire.ext_begin(var p, var b, 0xBEDE))
+    test.case("an extension after the payload")
+    let _ = rtpwire.begin(var p, var b, false, 0, 1, 0, 1)
+    let _ = rtpwire.push_payload(var p, var b, 1)
+    test.assert(not rtpwire.ext_begin(var p, var b, 0xBEDE))
+    test.case("payload while the extension is open")
+    let _ = rtpwire.begin(var p, var b, false, 0, 1, 0, 1)
+    let _ = rtpwire.ext_begin(var p, var b, 0xBEDE)
+    test.assert(not rtpwire.push_payload(var p, var b, 1))
+    test.case("closing an extension that is not open")
+    let _ = rtpwire.begin(var p, var b, false, 0, 1, 0, 1)
+    test.assert(not rtpwire.ext_end(var p, var b))
+
+@test
+fn test_extension_element_limits() [io]
+    var p: rtpwire.RtpPkt = Vec.new()
+    var b = rtpwire.builder()
+    var d: rtpbytes.RtpSmall = Vec.new()
+    for i in 0..20
+        let _ = d.push(i as u8)
+    test.case("one-byte form: IDs 1 to 14 and lengths 1 to 16")
+    let _ = rtpwire.begin(var p, var b, false, 0, 1, 0, 1)
+    let _ = rtpwire.ext_begin(var p, var b, 0xBEDE)
+    test.assert(rtpwire.ext_add(var p, var b, 14, var d, 16))
+    test.assert(not rtpwire.ext_add(var p, var b, 15, var d, 1))
+    let _ = rtpwire.begin(var p, var b, false, 0, 1, 0, 1)
+    let _ = rtpwire.ext_begin(var p, var b, 0xBEDE)
+    test.assert(not rtpwire.ext_add(var p, var b, 0, var d, 1))
+    let _ = rtpwire.begin(var p, var b, false, 0, 1, 0, 1)
+    let _ = rtpwire.ext_begin(var p, var b, 0xBEDE)
+    test.assert(not rtpwire.ext_add(var p, var b, 1, var d, 17))
+    let _ = rtpwire.begin(var p, var b, false, 0, 1, 0, 1)
+    let _ = rtpwire.ext_begin(var p, var b, 0xBEDE)
+    test.assert(not rtpwire.ext_add(var p, var b, 1, var d, 0))
+    test.case("two-byte form: ID 0 is refused")
+    let _ = rtpwire.begin(var p, var b, false, 0, 1, 0, 1)
+    let _ = rtpwire.ext_begin(var p, var b, 0x1000)
+    test.assert(not rtpwire.ext_add(var p, var b, 0, var d, 1))
+    let _ = rtpwire.begin(var p, var b, false, 0, 1, 0, 1)
+    let _ = rtpwire.ext_begin(var p, var b, 0x1000)
+    test.assert(not rtpwire.ext_add(var p, var b, 256, var d, 1))
+    test.case("more data than the buffer holds, and no extension open")
+    let _ = rtpwire.begin(var p, var b, false, 0, 1, 0, 1)
+    let _ = rtpwire.ext_begin(var p, var b, 0x1000)
+    test.assert(not rtpwire.ext_add(var p, var b, 1, var d, 21))
+    let _ = rtpwire.begin(var p, var b, false, 0, 1, 0, 1)
+    test.assert(not rtpwire.ext_add(var p, var b, 1, var d, 1))
+    test.assert_eq(p.len(), 0)
+
+@test
+fn test_a_full_buffer_is_refused_at_every_step() [io]
+    var d: rtpbytes.RtpSmall = Vec.new()
+    let _ = d.push(1 as u8)
+    test.case("payload")
+    var p = filled(1500)
+    var b = rtpwire.builder()
+    let _ = rtpwire.begin(var p, var b, false, 0, 1, 0, 1)
+    for _i in 0..1488
+        let _ = rtpwire.push_payload(var p, var b, 1)
+    test.assert_eq(p.len(), 1500)
+    test.assert(not rtpwire.push_payload(var p, var b, 1))
+    test.assert_eq(p.len(), 0)
+    test.case("a CSRC")
+    var q = filled(0)
+    let _ = rtpwire.begin(var q, var b, false, 0, 1, 0, 1)
+    for _i in 0..1488
+        let _ = rtpbytes.put_u8(var q, 0)
+    test.assert(not rtpwire.add_csrc(var q, var b, 1))
+    test.case("the extension header")
+    let _ = rtpwire.begin(var q, var b, false, 0, 1, 0, 1)
+    for _i in 0..1486
+        let _ = rtpbytes.put_u8(var q, 0)
+    test.assert(not rtpwire.ext_begin(var q, var b, 0xBEDE))
+    test.case("an element")
+    let _ = rtpwire.begin(var q, var b, false, 0, 1, 0, 1)
+    test.assert(rtpwire.ext_begin(var q, var b, 0xBEDE))
+    for _i in 0..1483
+        let _ = rtpbytes.put_u8(var q, 0)
+    test.assert(not rtpwire.ext_add(var q, var b, 1, var d, 1))
+    test.case("a raw word")
+    let _ = rtpwire.begin(var q, var b, false, 0, 1, 0, 1)
+    test.assert(rtpwire.ext_begin(var q, var b, 0x1234))
+    for _i in 0..1483
+        let _ = rtpbytes.put_u8(var q, 0)
+    test.assert(not rtpwire.ext_word(var q, var b, 1))
+    test.case("padding")
+    let _ = rtpwire.begin(var q, var b, false, 0, 1, 0, 1)
+    for _i in 0..1486
+        let _ = rtpbytes.put_u8(var q, 0)
+    test.assert(not rtpwire.add_padding(var q, var b, 4))
+
+@test
+fn test_sequence_numbers_and_timestamps_wrap() [io]
+    test.assert_eq(rtpwire.next_seq(65535), 0)
+    test.assert_eq(rtpwire.next_seq(7), 8)
+    test.assert_eq(rtpwire.seq_diff(2, 65534), 4)
+    test.assert_eq(rtpwire.seq_diff(65534, 2), -4)
+    test.assert_eq(rtpwire.seq_diff(5, 5), 0)
+    test.assert_eq(rtpwire.seq_diff(0x8000, 0), -32768)
+    test.assert_eq(rtpwire.seq_diff(0x7FFF, 0), 32767)
+    test.assert(rtpwire.seq_newer(1, 65535))
+    test.assert(not rtpwire.seq_newer(65535, 1))
+    test.assert_eq(rtpwire.ts_add(0xFFFFFFF0, 0x20), 0x10)
+    test.assert_eq(rtpwire.ts_add(100, 160), 260)

@@ -1,0 +1,550 @@
+// rtcpwire.nv — the RTCP control packets of RFC 3550 section 6, and the
+// compound packet that carries them, with no allocation.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  A compound packet is
+// built into a buffer the caller owns and read in place.
+//
+// THE COMMON HEADER of every RTCP packet is four bytes.
+//
+//    0                   1                   2                   3
+//    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+//   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//   |V=2|P|    RC   |       PT      |             length            |
+//   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//
+// RC is a count of report blocks (SR, RR), source chunks (SDES) or sources
+// (BYE), or the subtype of an APP packet.  PT is 200 for SR, 201 for RR, 202
+// for SDES, 203 for BYE and 204 for APP.  The length is the packet's size in
+// 32-bit words minus one, so a packet is a whole number of words and a
+// header-only packet has length 0.  When P is set the last byte of the
+// packet is a count of padding bytes, itself included.
+//
+// A COMPOUND PACKET is RTCP packets one after another in one datagram, with
+// nothing between them.  Section 6.1 asks for a report first (SR or RR, an
+// empty RR when there is nothing to report), an SDES with a CNAME in every
+// compound that is sent, and a BYE last.  `rtcp_check` is the validity check
+// of Appendix A.2, which a receiver runs on a datagram before it believes
+// it: the version, the type of the first packet, the padding bit of the
+// first packet, and the lengths adding up to the datagram.
+//
+// THE REPORT BLOCK is 24 bytes: the SSRC of the source it reports on, the
+// fraction lost since the last report as a number of 256ths, the cumulative
+// count of packets lost as a signed 24-bit number, the extended highest
+// sequence number received (the cycle count in the high 16 bits), the
+// interarrival jitter in timestamp units, the middle 32 bits of the NTP time
+// of the last sender report from that source (LSR) and the delay since that
+// report arrived in 1/65536 seconds (DLSR).
+//
+// NOT HERE.  The encryption of SRTCP is RFC 3711, which is not in this
+// package; a datagram arrives as bytes the caller has already decrypted.
+// Reports of the extended kinds (XR, RFC 3611) and the feedback messages of
+// RFC 4585 are payload types this package skips as unknown.
+
+use rtpbytes
+
+// The RTCP version: 2, as for RTP.
+pub const RTCP_VERSION = 2
+// The packet type of a sender report: 200.
+pub const RTCP_SR = 200
+// The packet type of a receiver report: 201.
+pub const RTCP_RR = 201
+// The packet type of a source description: 202.
+pub const RTCP_SDES = 202
+// The packet type of a goodbye: 203.
+pub const RTCP_BYE = 203
+// The packet type of an application-defined packet: 204.
+pub const RTCP_APP = 204
+
+// The SDES item that ends a chunk: 0.
+pub const SDES_END = 0
+// The SDES item CNAME, the canonical name: 1.
+pub const SDES_CNAME = 1
+// The SDES item NAME, a user's name: 2.
+pub const SDES_NAME = 2
+// The SDES item EMAIL: 3.
+pub const SDES_EMAIL = 3
+// The SDES item PHONE: 4.
+pub const SDES_PHONE = 4
+// The SDES item LOC, a geographic location: 5.
+pub const SDES_LOC = 5
+// The SDES item TOOL, the application's name and version: 6.
+pub const SDES_TOOL = 6
+// The SDES item NOTE, a transient message: 7.
+pub const SDES_NOTE = 7
+// The SDES item PRIV, a private extension: 8.
+pub const SDES_PRIV = 8
+
+// A compound packet that passes the validity check.
+pub const RTCP_OK = 0
+// The datagram is shorter than one header, or not a whole number of words.
+pub const RTCP_TOO_SHORT = 1
+// A packet's version is not 2.
+pub const RTCP_BAD_VERSION = 2
+// The first packet is neither an SR nor an RR.
+pub const RTCP_BAD_FIRST_TYPE = 3
+// The first packet has the padding bit set.
+pub const RTCP_BAD_FIRST_PADDING = 4
+// The lengths of the packets do not add up to the length of the datagram.
+pub const RTCP_BAD_LENGTH = 5
+// A packet's padding count is zero or longer than the packet.
+pub const RTCP_BAD_PADDING = 6
+// A packet's body is shorter than its type and count need, or its SDES
+// chunks do not end where the packet does.
+pub const RTCP_BAD_BODY = 7
+
+// The most report blocks, chunks or sources in one packet: 31.
+pub const RTCP_COUNT_MAX = 31
+
+// A buffer for one compound packet: the type every function here takes.
+pub alias RtcpPkt = rtpbytes.RtpBuf
+
+// A place in a compound packet: the packet last found.
+pub @value
+struct RtcpIter
+    // The index of the next packet's first byte.
+    pos: Int
+    // The length of the compound packet.
+    end: Int
+    // The packet type of the packet last found, or 0 before the first.
+    pt: Int
+    // Its count field: report blocks, chunks, sources, or the APP subtype.
+    count: Int
+    // The index of its header.
+    pkt_off: Int
+    // The index of the first byte after its four-byte header.
+    body_off: Int
+    // The length of its body in bytes, padding not counted.
+    body_len: Int
+    // True once the walk met a packet it could not read.
+    fault: Bool
+
+// The sender information of an SR.
+pub @value
+struct RtcpSenderInfo
+    // The SSRC of the sender.
+    ssrc: Int
+    // The seconds part of the NTP time of the report.
+    ntp_hi: Int
+    // The fraction part of the NTP time of the report, in 2^-32 seconds.
+    ntp_lo: Int
+    // The same instant in the RTP clock of the sender's media.
+    rtp_ts: Int
+    // The packets the sender has sent.
+    packets: Int
+    // The payload octets the sender has sent.
+    octets: Int
+
+// One report block of an SR or an RR.
+pub @value
+struct RtcpReportBlock
+    // The SSRC the block reports on.
+    ssrc: Int
+    // The fraction lost since the last report, in 256ths: 0 to 255.
+    fraction: Int
+    // The cumulative packets lost, from -8388608 to 8388607.
+    lost: Int
+    // The extended highest sequence number received.
+    ext_seq: Int
+    // The interarrival jitter in the RTP clock's units.
+    jitter: Int
+    // The middle 32 bits of the NTP time of the last SR from this source.
+    lsr: Int
+    // The delay since that SR arrived, in 1/65536 seconds.
+    dlsr: Int
+
+// A place in the items of an SDES packet: where the walk is, and the item
+// it last found.
+pub @value
+struct SdesIter
+    // The index of the next byte to read.
+    pos: Int
+    // The index at which the packet's body ends.
+    end: Int
+    // How many chunks remain, the current one not counted.
+    chunks_left: Int
+    // The SSRC or CSRC of the chunk being read.
+    ssrc: Int
+    // Whether the walk is inside a chunk.
+    in_chunk: Bool
+    // The type of the item last found.
+    item: Int
+    // The index of the first byte of its text.
+    text_off: Int
+    // The length of its text in bytes.
+    text_len: Int
+    // True once the walk met an item that runs past the packet.
+    fault: Bool
+
+// A report block with every field given.
+pub @tier(embedded)
+@no_alloc
+fn report_block(ssrc: Int, fraction: Int, lost: Int, ext_seq: Int, jitter: Int, lsr: Int,
+                dlsr: Int) -> RtcpReportBlock []
+    RtcpReportBlock { ssrc: ssrc, fraction: fraction, lost: lost, ext_seq: ext_seq,
+                      jitter: jitter, lsr: lsr, dlsr: dlsr }
+
+// ── Reading ─────────────────────────────────────────────────────────
+
+// The padding count of the packet at `off` that is `pkt_len` bytes long, or
+// -1 when its P bit is set and the count is zero or too large.  0 when the
+// bit is clear.
+@tier(embedded)
+@no_alloc
+fn pad_of(var m: RtcpPkt, off: Int, pkt_len: Int) -> Int []
+    if (rtpbytes.get_u8(var m, off) & 0x20) == 0
+        return 0
+    let pad = rtpbytes.get_u8(var m, off + pkt_len - 1)
+    if pad == 0 or pad > pkt_len - 4
+        return -1
+    pad
+
+// The minimum body length for a packet of type `pt` with `count` in its
+// count field.
+@tier(embedded)
+@no_alloc
+fn body_min(pt: Int, count: Int) -> Int []
+    if pt == RTCP_SR
+        return 24 + 24 * count
+    if pt == RTCP_RR
+        return 4 + 24 * count
+    if pt == RTCP_BYE
+        return 4 * count
+    if pt == RTCP_APP
+        return 8
+    // SDES chunks are checked by walking them; unknown types have no minimum.
+    0
+
+// An iterator at the first packet of a compound packet.
+pub @tier(embedded)
+@no_alloc
+fn rtcp_iter(var m: RtcpPkt) -> RtcpIter []
+    RtcpIter { pos: 0, end: m.len(), pt: 0, count: 0, pkt_off: 0, body_off: 0, body_len: 0,
+               fault: false }
+
+// Move to the next packet of a compound packet and answer whether there was
+// one.
+//
+// After a true answer `pt`, `count`, `pkt_off`, `body_off` and `body_len`
+// describe the packet.  The walk ends, with false, at the end of the
+// datagram, and at a packet it cannot read (a version other than 2, a length
+// that runs past the datagram, bad padding, a body too short for its type and
+// count, SDES chunks that do not end with the packet), which also sets
+// `fault`.  Packet types other than the five are returned and skipped by a
+// caller that does not know them.
+//
+// ```novo
+// use rtcpbuild
+// use rtcpwire
+//
+// fn main() [io]
+//     var m: rtcpwire.RtcpPkt = Vec.new()
+//     var b = rtcpbuild.builder()
+//     let _ = rtcpbuild.rtcp_rr(var m, var b, 0x1111)
+//     let _ = rtcpbuild.rtcp_bye(var m, var b, 0x1111, "")
+//     let _ = rtcpbuild.rtcp_finish(var m, var b)
+//     var it = rtcpwire.rtcp_iter(var m)
+//     var n = 0
+//     for _i in 0..4
+//         if rtcpwire.rtcp_next(var m, var it)
+//             n = n + it.pt
+//     println("${n}")   // 404
+// ```
+pub @tier(embedded)
+@no_alloc
+fn rtcp_next(var m: RtcpPkt, var it: RtcpIter) -> Bool []
+    if it.pos >= it.end
+        return false
+    if it.pos + 4 > it.end
+        it.fault = true
+        it.pos = it.end
+        return false
+    let b0 = rtpbytes.get_u8(var m, it.pos)
+    let pkt_len = 4 * (rtpbytes.get_u16(var m, it.pos + 2) + 1)
+    if (b0 >> 6) != RTCP_VERSION or it.pos + pkt_len > it.end
+        it.fault = true
+        it.pos = it.end
+        return false
+    let pad = pad_of(var m, it.pos, pkt_len)
+    let pt = rtpbytes.get_u8(var m, it.pos + 1)
+    let count = b0 & 31
+    if pad < 0 or pkt_len - 4 - pad < body_min(pt, count)
+        it.fault = true
+        it.pos = it.end
+        return false
+    it.pt = pt
+    it.count = count
+    it.pkt_off = it.pos
+    it.body_off = it.pos + 4
+    it.body_len = pkt_len - 4 - pad
+    it.pos = it.pos + pkt_len
+    if pt == RTCP_SDES
+        var s = sdes_iter(it)
+        if not sdes_valid(var m, var s)
+            it.fault = true
+            it.pos = it.end
+            return false
+    true
+
+// Whether the datagram in `m` is a valid compound packet by Appendix A.2 of
+// RFC 3550, and the fault if not: `RTCP_OK` or one of the other `RTCP_`
+// codes.
+//
+// The checks, in the order the RFC lists them: the version of the first
+// packet is 2; its type is SR or RR; its padding bit is clear; the lengths
+// of the packets add up to the datagram.  The version, padding and body of
+// every later packet are checked as well.
+//
+// ```novo
+// use rtcpbuild
+// use rtcpwire
+//
+// fn main() [io]
+//     var m: rtcpwire.RtcpPkt = Vec.new()
+//     var b = rtcpbuild.builder()
+//     let _ = rtcpbuild.rtcp_rr(var m, var b, 7)
+//     let _ = rtcpbuild.rtcp_finish(var m, var b)
+//     println("${rtcpwire.rtcp_check(var m)}")   // 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn rtcp_check(var m: RtcpPkt) -> Int []
+    if m.len() < 4 or (m.len() & 3) != 0
+        return RTCP_TOO_SHORT
+    if (rtpbytes.get_u8(var m, 0) >> 6) != RTCP_VERSION
+        return RTCP_BAD_VERSION
+    let first = rtpbytes.get_u8(var m, 1)
+    if first != RTCP_SR and first != RTCP_RR
+        return RTCP_BAD_FIRST_TYPE
+    if (rtpbytes.get_u8(var m, 0) & 0x20) != 0
+        return RTCP_BAD_FIRST_PADDING
+    var pos = 0
+    for _i in 0..m.len() / 4
+        if pos < m.len()
+            if (rtpbytes.get_u8(var m, pos) >> 6) != RTCP_VERSION
+                return RTCP_BAD_VERSION
+            let pkt_len = 4 * (rtpbytes.get_u16(var m, pos + 2) + 1)
+            if pos + pkt_len > m.len()
+                return RTCP_BAD_LENGTH
+            let pad = pad_of(var m, pos, pkt_len)
+            if pad < 0
+                return RTCP_BAD_PADDING
+            pos = pos + pkt_len
+    var it = rtcp_iter(var m)
+    for _i in 0..m.len() / 4
+        let _ = rtcp_next(var m, var it)
+    if it.fault
+        return RTCP_BAD_BODY
+    RTCP_OK
+
+// The sender information of an SR the iterator is at.  All fields are 0 when
+// the packet is not an SR.
+//
+// ```novo
+// use rtcpbuild
+// use rtcpwire
+//
+// fn main() [io]
+//     var m: rtcpwire.RtcpPkt = Vec.new()
+//     var b = rtcpbuild.builder()
+//     let _ = rtcpbuild.rtcp_sr(var m, var b, 0xAA, 3, 4, 5, 6, 7)
+//     let _ = rtcpbuild.rtcp_finish(var m, var b)
+//     var it = rtcpwire.rtcp_iter(var m)
+//     let _ = rtcpwire.rtcp_next(var m, var it)
+//     let s = rtcpwire.sr_info(var m, it)
+//     println("${s.ssrc} ${s.ntp_hi} ${s.ntp_lo} ${s.rtp_ts} ${s.packets} ${s.octets}")   // 170 3 4 5 6 7
+// ```
+pub @tier(embedded)
+@no_alloc
+fn sr_info(var m: RtcpPkt, it: RtcpIter) -> RtcpSenderInfo []
+    if it.pt != RTCP_SR
+        return RtcpSenderInfo { ssrc: 0, ntp_hi: 0, ntp_lo: 0, rtp_ts: 0, packets: 0, octets: 0 }
+    let o = it.body_off
+    RtcpSenderInfo { ssrc: rtpbytes.get_u32(var m, o), ntp_hi: rtpbytes.get_u32(var m, o + 4),
+                     ntp_lo: rtpbytes.get_u32(var m, o + 8), rtp_ts: rtpbytes.get_u32(var m, o + 12),
+                     packets: rtpbytes.get_u32(var m, o + 16),
+                     octets: rtpbytes.get_u32(var m, o + 20) }
+
+// The SSRC of the sender of an SR or an RR, or 0 for another packet type.
+pub @tier(embedded)
+@no_alloc
+fn report_ssrc(var m: RtcpPkt, it: RtcpIter) -> Int []
+    if it.pt != RTCP_SR and it.pt != RTCP_RR
+        return 0
+    rtpbytes.get_u32(var m, it.body_off)
+
+// Report block `i` of the SR or RR the iterator is at, or an all-zero block
+// when `i` is outside `count` or the packet is neither.
+pub @tier(embedded)
+@no_alloc
+fn read_block(var m: RtcpPkt, it: RtcpIter, i: Int) -> RtcpReportBlock []
+    if it.pt != RTCP_SR and it.pt != RTCP_RR or i < 0 or i >= it.count
+        return report_block(0, 0, 0, 0, 0, 0, 0)
+    var o = it.body_off + 4 + 24 * i
+    if it.pt == RTCP_SR
+        o = o + 20
+    let word = rtpbytes.get_u32(var m, o + 4)
+    var lost = word & 0xFFFFFF
+    if lost >= 0x800000
+        lost = lost - 0x1000000
+    RtcpReportBlock { ssrc: rtpbytes.get_u32(var m, o), fraction: word >> 24, lost: lost,
+                      ext_seq: rtpbytes.get_u32(var m, o + 8), jitter: rtpbytes.get_u32(var m, o + 12),
+                      lsr: rtpbytes.get_u32(var m, o + 16), dlsr: rtpbytes.get_u32(var m, o + 20) }
+
+// An SDES iterator at the first chunk of the SDES packet the iterator is at.
+pub @tier(embedded)
+@no_alloc
+fn sdes_iter(it: RtcpIter) -> SdesIter []
+    SdesIter { pos: it.body_off, end: it.body_off + it.body_len, chunks_left: it.count, ssrc: 0,
+               in_chunk: false, item: 0, text_off: 0, text_len: 0, fault: false }
+
+// Move to the next item of an SDES packet and answer whether there was one.
+//
+// `ssrc` is the source of the chunk the item belongs to; `item`, `text_off`
+// and `text_len` describe it.  A chunk ends at an item of type 0 and at the
+// next word boundary, and the walk steps over both.  The walk ends, with
+// false, after the last chunk and at an item that runs past the packet, which
+// also sets `fault`.
+//
+// ```novo
+// use rtcpbuild
+// use rtcpwire
+//
+// fn main() [io]
+//     var m: rtcpwire.RtcpPkt = Vec.new()
+//     var b = rtcpbuild.builder()
+//     let _ = rtcpbuild.rtcp_sdes(var m, var b)
+//     let _ = rtcpbuild.rtcp_sdes_chunk(var m, var b, 0x1234)
+//     let _ = rtcpbuild.rtcp_sdes_item(var m, var b, rtcpwire.SDES_CNAME, "a@b")
+//     let _ = rtcpbuild.rtcp_finish(var m, var b)
+//     var it = rtcpwire.rtcp_iter(var m)
+//     let _ = rtcpwire.rtcp_next(var m, var it)
+//     var s = rtcpwire.sdes_iter(it)
+//     let more = rtcpwire.sdes_next(var m, var s)
+//     println("${more} ${s.ssrc} ${s.item} ${s.text_len}")   // true 4660 1 3
+// ```
+pub @tier(embedded)
+@no_alloc
+fn sdes_next(var m: RtcpPkt, var s: SdesIter) -> Bool []
+    for _i in 0..s.end + 1
+        if not s.in_chunk
+            if s.chunks_left == 0
+                return false
+            if s.pos + 4 > s.end
+                s.fault = true
+                s.chunks_left = 0
+                return false
+            s.ssrc = rtpbytes.get_u32(var m, s.pos)
+            s.pos = s.pos + 4
+            s.in_chunk = true
+            s.chunks_left = s.chunks_left - 1
+        else
+            if s.pos >= s.end
+                s.fault = true
+                s.chunks_left = 0
+                s.in_chunk = false
+                return false
+            let t = rtpbytes.get_u8(var m, s.pos)
+            if t == SDES_END
+                // The terminator and the zero bytes that fill the word.
+                s.pos = (s.pos / 4 + 1) * 4
+                s.in_chunk = false
+            else
+                if s.pos + 2 > s.end
+                    s.fault = true
+                    s.chunks_left = 0
+                    s.in_chunk = false
+                    return false
+                let n = rtpbytes.get_u8(var m, s.pos + 1)
+                if s.pos + 2 + n > s.end
+                    s.fault = true
+                    s.chunks_left = 0
+                    s.in_chunk = false
+                    return false
+                s.item = t
+                s.text_off = s.pos + 2
+                s.text_len = n
+                s.pos = s.pos + 2 + n
+                return true
+    // The loop returns first: every pass advances `pos` by at least one byte
+    // and `end` bounds the passes.
+    // cov: skip — the bounded loop always returns before it is spent
+    false
+
+// Whether every chunk of the SDES packet walks to the end of its body with
+// nothing left over.
+@tier(embedded)
+@no_alloc
+fn sdes_valid(var m: RtcpPkt, var s: SdesIter) -> Bool []
+    for _i in 0..s.end + 1
+        let _ = sdes_next(var m, var s)
+    not s.fault and s.chunks_left == 0 and not s.in_chunk and s.pos == s.end
+
+// Source `i` of the BYE the iterator is at, or 0 outside its count.
+pub @tier(embedded)
+@no_alloc
+fn bye_ssrc(var m: RtcpPkt, it: RtcpIter, i: Int) -> Int []
+    if it.pt != RTCP_BYE or i < 0 or i >= it.count
+        return 0
+    rtpbytes.get_u32(var m, it.body_off + 4 * i)
+
+// The index of the reason text of the BYE the iterator is at, or -1 when it
+// has none.  The length is `bye_reason_len`.
+pub @tier(embedded)
+@no_alloc
+fn bye_reason_off(it: RtcpIter) -> Int []
+    if it.pt != RTCP_BYE or it.body_len <= 4 * it.count
+        return -1
+    it.body_off + 4 * it.count + 1
+
+// The length of the reason text of the BYE the iterator is at, in bytes, or
+// 0 when it has none or the length runs past the packet.
+pub @tier(embedded)
+@no_alloc
+fn bye_reason_len(var m: RtcpPkt, it: RtcpIter) -> Int []
+    let off = bye_reason_off(it)
+    if off < 0
+        return 0
+    let n = rtpbytes.get_u8(var m, off - 1)
+    if off + n > it.body_off + it.body_len
+        return 0
+    n
+
+// The subtype of the APP packet the iterator is at: its count field, or -1
+// for another packet type.
+pub @tier(embedded)
+@no_alloc
+fn app_subtype(it: RtcpIter) -> Int []
+    if it.pt != RTCP_APP
+        return -1
+    it.count
+
+// The SSRC or CSRC of the APP packet the iterator is at, or 0.
+pub @tier(embedded)
+@no_alloc
+fn app_ssrc(var m: RtcpPkt, it: RtcpIter) -> Int []
+    if it.pt != RTCP_APP
+        return 0
+    rtpbytes.get_u32(var m, it.body_off)
+
+// The four-character name of the APP packet the iterator is at, as one
+// number with the first character highest: "ABCD" is 0x41424344.  0 for
+// another packet type.
+pub @tier(embedded)
+@no_alloc
+fn app_name(var m: RtcpPkt, it: RtcpIter) -> Int []
+    if it.pt != RTCP_APP
+        return 0
+    rtpbytes.get_u32(var m, it.body_off + 4)
+
+// The index of the data of the APP packet the iterator is at.  Its length is
+// `app_data_len`.
+pub @tier(embedded)
+@no_alloc
+fn app_data_off(it: RtcpIter) -> Int []
+    it.body_off + 8
+
+// The length of the data of the APP packet the iterator is at, in bytes.
+pub @tier(embedded)
+@no_alloc
+fn app_data_len(it: RtcpIter) -> Int []
+    it.body_len - 8

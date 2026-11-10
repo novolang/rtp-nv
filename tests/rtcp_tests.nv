@@ -1,0 +1,558 @@
+// rtcp_tests.nv — the RTCP packets, byte by byte.
+//
+// THE VECTORS ARE DERIVED BY HAND from section 6 of RFC 3550, not recorded
+// from this code.  The common header is V(2) P RC(5) in the first byte, so a
+// packet with RC = 1 and no padding starts 0x81; the second byte is the
+// packet type (SR 200 = 0xC8, RR 201 = 0xC9, SDES 202 = 0xCA, BYE 203 =
+// 0xCB, APP 204 = 0xCC); the next two bytes are the length in words minus one.
+// An SR with one report block is 4 + 24 + 24 = 52 bytes, 13 words, so its
+// length field is 12.  Each other vector is worked out in the comment above
+// it.
+
+use std.str
+use std.test
+use rtcpbuild
+use rtcpwire
+use rtpbytes
+
+// A compound packet from a list of byte values.
+fn pkt_of(xs: [Int]) -> rtcpwire.RtcpPkt
+    var p: rtcpwire.RtcpPkt = Vec.new()
+    for x in xs
+        let _ = p.push(x as u8)
+    p
+
+// The index of the first byte of the packet that differs from the expected
+// list, -2 when the lengths differ, and -1 when they agree.
+fn diff(var p: rtcpwire.RtcpPkt, want: [Int]) -> Int
+    if p.len() != list.len(want)
+        return -2
+    for i in 0..p.len()
+        if (p[i] as Int) != want[i]
+            return i
+    -1
+
+// Fill the buffer with zeros until `room` bytes remain.
+fn fill_to(var p: rtcpwire.RtcpPkt, room: Int)
+    for _i in 0..1500
+        if p.len() < 1500 - room
+            let _ = p.push(0 as u8)
+
+// The compound packet of the first test: SR with one report block, SDES
+// with a CNAME, BYE.
+fn sr_sdes_bye() -> [Int]
+    [0x81, 0xC8, 0x00, 0x0C,
+     0x00, 0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00,
+     0x00, 0x00, 0x03, 0x20, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x03, 0x20,
+     0x00, 0x00, 0x00, 0x02, 0x40, 0x00, 0x00, 0x03, 0x00, 0x01, 0x00, 0x05,
+     0x00, 0x00, 0x00, 0x10, 0xE0, 0x00, 0x80, 0x00, 0x00, 0x01, 0x80, 0x00,
+     0x81, 0xCA, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x01, 0x02, 0x61, 0x62,
+     0x00, 0x00, 0x00, 0x00,
+     0x81, 0xCB, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x03, 0x62, 0x79, 0x65]
+
+@test
+fn test_a_compound_packet_built_and_read() [io]
+    // SR: SSRC 1, NTP 0xE0000000.80000000, RTP timestamp 800 = 0x320, 5
+    // packets, 800 octets.  Report block: SSRC 2, fraction lost 0x40 = 64
+    // (a quarter), 3 lost (00 00 03), extended highest sequence 0x00010005,
+    // jitter 16, LSR 0xE0008000, DLSR 0x00018000 (1.5 seconds).
+    // SDES: one chunk for SSRC 1 with CNAME "ab": 01 02 61 62, then a zero
+    // terminator and three zeros to fill the word.  BYE for SSRC 1, reason
+    // "bye": the length byte 03 and 62 79 65.
+    test.case("the bytes are the three packets one after another")
+    var m: rtcpwire.RtcpPkt = Vec.new()
+    var b = rtcpbuild.builder()
+    test.assert(rtcpbuild.rtcp_sr(var m, var b, 1, 0xE0000000, 0x80000000, 800, 5, 800))
+    test.assert(rtcpbuild.rtcp_report(var m, var b,
+        rtcpwire.report_block(2, 64, 3, 0x00010005, 16, 0xE0008000, 0x00018000)))
+    test.assert(rtcpbuild.rtcp_sdes(var m, var b))
+    test.assert(rtcpbuild.rtcp_sdes_chunk(var m, var b, 1))
+    test.assert(rtcpbuild.rtcp_sdes_item(var m, var b, rtcpwire.SDES_CNAME, "ab"))
+    test.assert(rtcpbuild.rtcp_bye(var m, var b, 1, "bye"))
+    test.assert(rtcpbuild.rtcp_finish(var m, var b))
+    test.assert_eq(diff(var m, sr_sdes_bye()), -1)
+
+    test.case("it passes the validity check")
+    test.assert_eq(rtcpwire.rtcp_check(var m), rtcpwire.RTCP_OK)
+
+    test.case("the iterator reads the SR and its block")
+    var it = rtcpwire.rtcp_iter(var m)
+    test.assert(rtcpwire.rtcp_next(var m, var it))
+    test.assert_eq(it.pt, rtcpwire.RTCP_SR)
+    test.assert_eq(it.count, 1)
+    test.assert_eq(it.body_len, 48)
+    let s = rtcpwire.sr_info(var m, it)
+    test.assert_eq(s.ssrc, 1)
+    test.assert_eq(s.ntp_hi, 0xE0000000)
+    test.assert_eq(s.ntp_lo, 0x80000000)
+    test.assert_eq(s.rtp_ts, 800)
+    test.assert_eq(s.packets, 5)
+    test.assert_eq(s.octets, 800)
+    test.assert_eq(rtcpwire.report_ssrc(var m, it), 1)
+    let r = rtcpwire.read_block(var m, it, 0)
+    test.assert_eq(r.ssrc, 2)
+    test.assert_eq(r.fraction, 64)
+    test.assert_eq(r.lost, 3)
+    test.assert_eq(r.ext_seq, 0x00010005)
+    test.assert_eq(r.jitter, 16)
+    test.assert_eq(r.lsr, 0xE0008000)
+    test.assert_eq(r.dlsr, 0x00018000)
+    test.assert_eq(rtcpwire.read_block(var m, it, 1).ssrc, 0)
+    test.assert_eq(rtcpwire.read_block(var m, it, -1).ssrc, 0)
+
+    test.case("the SDES chunk has the CNAME")
+    test.assert(rtcpwire.rtcp_next(var m, var it))
+    test.assert_eq(it.pt, rtcpwire.RTCP_SDES)
+    var sd = rtcpwire.sdes_iter(it)
+    test.assert(rtcpwire.sdes_next(var m, var sd))
+    test.assert_eq(sd.ssrc, 1)
+    test.assert_eq(sd.item, rtcpwire.SDES_CNAME)
+    test.assert(rtpbytes.eq_str(var m, sd.text_off, sd.text_len, "ab"))
+    test.assert(not rtcpwire.sdes_next(var m, var sd))
+    test.assert(not sd.fault)
+    // A report accessor on another type answers zero.
+    test.assert_eq(rtcpwire.report_ssrc(var m, it), 0)
+    test.assert_eq(rtcpwire.read_block(var m, it, 0).ssrc, 0)
+    test.assert_eq(rtcpwire.sr_info(var m, it).ssrc, 0)
+
+    test.case("the BYE has its source and reason")
+    test.assert(rtcpwire.rtcp_next(var m, var it))
+    test.assert_eq(it.pt, rtcpwire.RTCP_BYE)
+    test.assert_eq(rtcpwire.bye_ssrc(var m, it, 0), 1)
+    test.assert_eq(rtcpwire.bye_ssrc(var m, it, 1), 0)
+    test.assert_eq(rtcpwire.bye_ssrc(var m, it, -1), 0)
+    test.assert_eq(rtcpwire.bye_reason_len(var m, it), 3)
+    test.assert(rtpbytes.eq_str(var m, rtcpwire.bye_reason_off(it), 3, "bye"))
+    test.assert(not rtcpwire.rtcp_next(var m, var it))
+    test.assert(not it.fault)
+
+@test
+fn test_a_receiver_report_and_an_empty_one() [io]
+    // An RR with no blocks: 80 C9 00 01 and the SSRC.
+    test.case("an empty RR")
+    var m: rtcpwire.RtcpPkt = Vec.new()
+    var b = rtcpbuild.builder()
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 0x01020304))
+    test.assert(rtcpbuild.rtcp_finish(var m, var b))
+    test.assert_eq(diff(var m, [0x80, 0xC9, 0x00, 0x01, 0x01, 0x02, 0x03, 0x04]), -1)
+    test.assert_eq(rtcpwire.rtcp_check(var m), rtcpwire.RTCP_OK)
+
+    test.case("an RR with a block, the lost count negative")
+    // Lost -1 is the 24-bit value FF FF FF.
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 9))
+    test.assert(rtcpbuild.rtcp_report(var m, var b, rtcpwire.report_block(7, 255, -1, 1, 2, 3, 4)))
+    test.assert(rtcpbuild.rtcp_finish(var m, var b))
+    test.assert_eq(diff(var m, [0x81, 0xC9, 0x00, 0x07, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00,
+                                0x00, 0x07, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x01,
+                                0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00,
+                                0x00, 0x04]),
+                                -1)
+    var it = rtcpwire.rtcp_iter(var m)
+    test.assert(rtcpwire.rtcp_next(var m, var it))
+    test.assert_eq(rtcpwire.report_ssrc(var m, it), 9)
+    let r = rtcpwire.read_block(var m, it, 0)
+    test.assert_eq(r.lost, -1)
+    test.assert_eq(r.fraction, 255)
+    test.case("the most negative count is -8388608")
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 9))
+    test.assert(rtcpbuild.rtcp_report(var m, var b, rtcpwire.report_block(7, 0, -8388608, 1, 2, 3, 4)))
+    test.assert(rtcpbuild.rtcp_finish(var m, var b))
+    test.assert_eq(rtpbytes.get_u8(var m, 13), 0x80)
+    var i2 = rtcpwire.rtcp_iter(var m)
+    test.assert(rtcpwire.rtcp_next(var m, var i2))
+    test.assert_eq(rtcpwire.read_block(var m, i2, 0).lost, -8388608)
+
+@test
+fn test_sdes_with_several_chunks_and_items() [io]
+    // Two chunks.  Chunk 1: SSRC 1, CNAME "x" (01 01 78) and NAME "yz"
+    // (02 02 79 7A): 4 + 3 + 4 = 11 bytes, a terminator and no more fill
+    // needed beyond 12: one zero.  Chunk 2: SSRC 2 and no items: 4 bytes and
+    // a full word of zeros, 8.  Body 12 + 8 = 20, packet 24 bytes, length 5.
+    test.case("the bytes")
+    var m: rtcpwire.RtcpPkt = Vec.new()
+    var b = rtcpbuild.builder()
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 5))
+    test.assert(rtcpbuild.rtcp_sdes(var m, var b))
+    test.assert(rtcpbuild.rtcp_sdes_chunk(var m, var b, 1))
+    test.assert(rtcpbuild.rtcp_sdes_item(var m, var b, rtcpwire.SDES_CNAME, "x"))
+    test.assert(rtcpbuild.rtcp_sdes_item(var m, var b, rtcpwire.SDES_NAME, "yz"))
+    test.assert(rtcpbuild.rtcp_sdes_chunk(var m, var b, 2))
+    test.assert(rtcpbuild.rtcp_finish(var m, var b))
+    test.assert_eq(diff(var m, [0x80, 0xC9, 0x00, 0x01, 0x00, 0x00, 0x00, 0x05,
+                                0x82, 0xCA, 0x00, 0x05, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01,
+                                0x78, 0x02, 0x02, 0x79, 0x7A, 0x00, 0x00, 0x00, 0x00, 0x02,
+                                0x00, 0x00, 0x00, 0x00]),
+                                -1)
+    test.assert_eq(rtcpwire.rtcp_check(var m), rtcpwire.RTCP_OK)
+
+    test.case("the walk finds both items of chunk 1 and none of chunk 2")
+    var it = rtcpwire.rtcp_iter(var m)
+    test.assert(rtcpwire.rtcp_next(var m, var it))
+    test.assert(rtcpwire.rtcp_next(var m, var it))
+    var s = rtcpwire.sdes_iter(it)
+    test.assert(rtcpwire.sdes_next(var m, var s))
+    test.assert_eq(s.item, rtcpwire.SDES_CNAME)
+    test.assert(rtcpwire.sdes_next(var m, var s))
+    test.assert_eq(s.item, rtcpwire.SDES_NAME)
+    test.assert_eq(s.text_len, 2)
+    test.assert(not rtcpwire.sdes_next(var m, var s))
+    test.assert(not s.fault)
+
+@test
+fn test_bye_app_and_unknown_packets() [io]
+    // A BYE for SSRC 1 with the reason "ok": 81 CB 00 02, 00 00 00 01, the
+    // length 02 and 6F 6B, then one zero to the word.
+    test.case("a BYE with an odd reason is filled to the word")
+    var m: rtcpwire.RtcpPkt = Vec.new()
+    var b = rtcpbuild.builder()
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 5))
+    test.assert(rtcpbuild.rtcp_bye(var m, var b, 1, "ok"))
+    test.assert(rtcpbuild.rtcp_finish(var m, var b))
+    test.assert_eq(diff(var m, [0x80, 0xC9, 0x00, 0x01, 0x00, 0x00, 0x00, 0x05, 0x81, 0xCB,
+                                0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x02, 0x6F, 0x6B, 0x00]),
+                                -1)
+    test.case("a BYE with no reason has no reason text")
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 5))
+    test.assert(rtcpbuild.rtcp_bye(var m, var b, 1, ""))
+    test.assert(rtcpbuild.rtcp_finish(var m, var b))
+    var it = rtcpwire.rtcp_iter(var m)
+    test.assert(rtcpwire.rtcp_next(var m, var it))
+    test.assert(rtcpwire.rtcp_next(var m, var it))
+    test.assert_eq(rtcpwire.bye_reason_off(it), -1)
+    test.assert_eq(rtcpwire.bye_reason_len(var m, it), 0)
+
+    // An APP packet, subtype 3 (the first byte 0x83), name "ABCD", SSRC 1
+    // and the data DE AD BE EF: 16 bytes, length 3.
+    test.case("an APP packet")
+    var d: rtpbytes.RtpSmall = Vec.new()
+    for v in [0xDE, 0xAD, 0xBE, 0xEF]
+        let _ = d.push(v as u8)
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 5))
+    test.assert(rtcpbuild.rtcp_app(var m, var b, 3, 1, 0x41424344, var d, 4))
+    test.assert(rtcpbuild.rtcp_finish(var m, var b))
+    test.assert_eq(diff(var m, [0x80, 0xC9, 0x00, 0x01, 0x00, 0x00, 0x00, 0x05, 0x83, 0xCC,
+                                0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x41, 0x42, 0x43, 0x44,
+                                0xDE, 0xAD, 0xBE, 0xEF]),
+                                -1)
+    var i2 = rtcpwire.rtcp_iter(var m)
+    test.assert(rtcpwire.rtcp_next(var m, var i2))
+    test.assert(rtcpwire.rtcp_next(var m, var i2))
+    test.assert_eq(rtcpwire.app_subtype(i2), 3)
+    test.assert_eq(rtcpwire.app_ssrc(var m, i2), 1)
+    test.assert_eq(rtcpwire.app_name(var m, i2), 0x41424344)
+    test.assert_eq(rtcpwire.app_data_len(i2), 4)
+    test.assert_eq(rtpbytes.get_u8(var m, rtcpwire.app_data_off(i2)), 0xDE)
+    test.case("the APP accessors answer neutral values for another type")
+    var i3 = rtcpwire.rtcp_iter(var m)
+    test.assert(rtcpwire.rtcp_next(var m, var i3))
+    test.assert_eq(rtcpwire.app_subtype(i3), -1)
+    test.assert_eq(rtcpwire.app_ssrc(var m, i3), 0)
+    test.assert_eq(rtcpwire.app_name(var m, i3), 0)
+    test.assert_eq(rtcpwire.bye_reason_off(i3), -1)
+    test.assert_eq(rtcpwire.bye_ssrc(var m, i3, 0), 0)
+
+    test.case("a packet type this package does not know is returned and skipped")
+    // Type 207 (XR), RC 0, one word of body.
+    var u = pkt_of([0x80, 0xC9, 0x00, 0x01, 0, 0, 0, 1, 0x80, 0xCF, 0x00, 0x01, 0, 0, 0, 9])
+    test.assert_eq(rtcpwire.rtcp_check(var u), rtcpwire.RTCP_OK)
+    var i4 = rtcpwire.rtcp_iter(var u)
+    test.assert(rtcpwire.rtcp_next(var u, var i4))
+    test.assert(rtcpwire.rtcp_next(var u, var i4))
+    test.assert_eq(i4.pt, 207)
+    test.assert(not rtcpwire.rtcp_next(var u, var i4))
+
+@test
+fn test_padding_in_the_last_packet() [io]
+    // An RR then 4 bytes of padding: the P bit makes the first byte 0xA0,
+    // the length covers the padding: 8 + 4 = 12 bytes, length 2, and the
+    // padding bytes are 00 00 00 04.
+    test.case("the P bit and the count")
+    var m: rtcpwire.RtcpPkt = Vec.new()
+    var b = rtcpbuild.builder()
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 5))
+    test.assert(rtcpbuild.rtcp_bye(var m, var b, 1, "ok"))
+    test.assert(rtcpbuild.rtcp_pad(var m, var b, 4))
+    test.assert(rtcpbuild.rtcp_finish(var m, var b))
+    // The BYE: 81 CB, then 8 bytes of body (the reason filled with one zero to
+    // the word), then 4 padding: 16 bytes, length 3; the P bit makes the
+    // first byte 0xA1.
+    test.assert_eq(diff(var m, [0x80, 0xC9, 0x00, 0x01, 0x00, 0x00, 0x00, 0x05, 0xA1, 0xCB,
+                                0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x02, 0x6F, 0x6B, 0x00,
+                                0x00, 0x00, 0x00, 0x04]),
+                                -1)
+    test.assert_eq(rtcpwire.rtcp_check(var m), rtcpwire.RTCP_OK)
+    var it = rtcpwire.rtcp_iter(var m)
+    test.assert(rtcpwire.rtcp_next(var m, var it))
+    test.assert(rtcpwire.rtcp_next(var m, var it))
+    test.assert_eq(it.body_len, 8)
+    test.assert_eq(rtcpwire.bye_reason_len(var m, it), 2)
+
+@test
+fn test_the_validity_check_of_appendix_a2() [io]
+    test.case("shorter than a header, or not whole words")
+    var a = pkt_of([0x80, 0xC9, 0x00])
+    test.assert_eq(rtcpwire.rtcp_check(var a), rtcpwire.RTCP_TOO_SHORT)
+    var a2 = pkt_of([0x80, 0xC9, 0x00, 0x01, 0, 0, 0, 1, 0])
+    test.assert_eq(rtcpwire.rtcp_check(var a2), rtcpwire.RTCP_TOO_SHORT)
+    test.case("version 1 in the first packet")
+    var b = pkt_of([0x40, 0xC9, 0x00, 0x01, 0, 0, 0, 1])
+    test.assert_eq(rtcpwire.rtcp_check(var b), rtcpwire.RTCP_BAD_VERSION)
+    test.case("the first packet is a BYE, not a report")
+    var c = pkt_of([0x81, 0xCB, 0x00, 0x01, 0, 0, 0, 1])
+    test.assert_eq(rtcpwire.rtcp_check(var c), rtcpwire.RTCP_BAD_FIRST_TYPE)
+    test.case("the first packet has the padding bit set")
+    var d = pkt_of([0xA0, 0xC9, 0x00, 0x01, 0, 0, 0, 4])
+    test.assert_eq(rtcpwire.rtcp_check(var d), rtcpwire.RTCP_BAD_FIRST_PADDING)
+    test.case("the length runs past the datagram")
+    var e = pkt_of([0x80, 0xC9, 0x00, 0x02, 0, 0, 0, 1])
+    test.assert_eq(rtcpwire.rtcp_check(var e), rtcpwire.RTCP_BAD_LENGTH)
+    test.case("the version of a later packet")
+    var f = pkt_of([0x80, 0xC9, 0x00, 0x01, 0, 0, 0, 1, 0x40, 0xC9, 0x00, 0x01, 0, 0, 0, 1])
+    test.assert_eq(rtcpwire.rtcp_check(var f), rtcpwire.RTCP_BAD_VERSION)
+    test.case("a later packet whose length runs past")
+    var g = pkt_of([0x80, 0xC9, 0x00, 0x01, 0, 0, 0, 1, 0x80, 0xC9, 0x00, 0x05, 0, 0, 0, 1])
+    test.assert_eq(rtcpwire.rtcp_check(var g), rtcpwire.RTCP_BAD_LENGTH)
+    test.case("a later packet with a padding count of zero")
+    var h = pkt_of([0x80, 0xC9, 0x00, 0x01, 0, 0, 0, 1, 0xA0, 0xC9, 0x00, 0x01, 0, 0, 0, 0])
+    test.assert_eq(rtcpwire.rtcp_check(var h), rtcpwire.RTCP_BAD_PADDING)
+    test.case("a later packet with a padding count larger than the packet")
+    var h2 = pkt_of([0x80, 0xC9, 0x00, 0x01, 0, 0, 0, 1, 0xA0, 0xC9, 0x00, 0x01, 0, 0, 0, 5])
+    test.assert_eq(rtcpwire.rtcp_check(var h2), rtcpwire.RTCP_BAD_PADDING)
+    test.case("an SR whose body is shorter than its count says")
+    var i = pkt_of([0x81, 0xC8, 0x00, 0x06, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0])
+    test.assert_eq(rtcpwire.rtcp_check(var i), rtcpwire.RTCP_BAD_BODY)
+    test.case("an RR whose body is shorter than its count says")
+    var j = pkt_of([0x81, 0xC9, 0x00, 0x01, 0, 0, 0, 1])
+    test.assert_eq(rtcpwire.rtcp_check(var j), rtcpwire.RTCP_BAD_BODY)
+    test.case("a BYE that claims more sources than it holds")
+    var k = pkt_of([0x80, 0xC9, 0x00, 0x01, 0, 0, 0, 1, 0x83, 0xCB, 0x00, 0x01, 0, 0, 0, 1])
+    test.assert_eq(rtcpwire.rtcp_check(var k), rtcpwire.RTCP_BAD_BODY)
+    test.case("an APP packet with no room for its name")
+    var l = pkt_of([0x80, 0xC9, 0x00, 0x01, 0, 0, 0, 1, 0x80, 0xCC, 0x00, 0x01, 0, 0, 0, 1])
+    test.assert_eq(rtcpwire.rtcp_check(var l), rtcpwire.RTCP_BAD_BODY)
+
+@test
+fn test_sdes_faults() [io]
+    // Each case is a lone SDES packet read with the iterator, because the
+    // validity check wants a report first.
+    test.case("a chunk count with no bytes for the chunk")
+    var a = pkt_of([0x81, 0xCA, 0x00, 0x00])
+    var ia = rtcpwire.rtcp_iter(var a)
+    test.assert(not rtcpwire.rtcp_next(var a, var ia))
+    test.assert(ia.fault)
+    test.case("a chunk with an SSRC and then nothing")
+    var b = pkt_of([0x81, 0xCA, 0x00, 0x01, 0, 0, 0, 1])
+    var ib = rtcpwire.rtcp_iter(var b)
+    test.assert(not rtcpwire.rtcp_next(var b, var ib))
+    test.assert(ib.fault)
+    test.case("an item with its length byte cut off by the padding")
+    // P set (0xA1), 12 bytes, padding count 3: the body is the SSRC and the
+    // one byte 01.
+    var c = pkt_of([0xA1, 0xCA, 0x00, 0x02, 0, 0, 0, 1, 0x01, 0x00, 0x00, 0x03])
+    var ic = rtcpwire.rtcp_iter(var c)
+    test.assert(not rtcpwire.rtcp_next(var c, var ic))
+    test.assert(ic.fault)
+    test.case("an item whose text runs past the packet")
+    var d = pkt_of([0x81, 0xCA, 0x00, 0x02, 0, 0, 0, 1, 0x01, 0x05, 0x61, 0x62])
+    var id = rtcpwire.rtcp_iter(var d)
+    test.assert(not rtcpwire.rtcp_next(var d, var id))
+    test.assert(id.fault)
+    test.case("bytes left over after the last chunk")
+    var e = pkt_of([0x81, 0xCA, 0x00, 0x03, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0])
+    var ie = rtcpwire.rtcp_iter(var e)
+    test.assert(not rtcpwire.rtcp_next(var e, var ie))
+    test.assert(ie.fault)
+    test.case("a second chunk announced and no bytes for it")
+    var e2 = pkt_of([0x82, 0xCA, 0x00, 0x02, 0, 0, 0, 1, 0, 0, 0, 0])
+    var ie2 = rtcpwire.rtcp_iter(var e2)
+    test.assert(not rtcpwire.rtcp_next(var e2, var ie2))
+    test.assert(ie2.fault)
+    test.case("an iterator over a datagram too short for a header")
+    var f = pkt_of([0x80, 0xC9, 0x00])
+    var iff = rtcpwire.rtcp_iter(var f)
+    test.assert(not rtcpwire.rtcp_next(var f, var iff))
+    test.assert(iff.fault)
+
+@test
+fn test_builder_refusals() [io]
+    var m: rtcpwire.RtcpPkt = Vec.new()
+    var b = rtcpbuild.builder()
+    var d: rtpbytes.RtpSmall = Vec.new()
+    for v in [1, 2, 3, 4, 5]
+        let _ = d.push(v as u8)
+    test.case("a report block needs an SR or an RR")
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    test.assert(rtcpbuild.rtcp_sdes(var m, var b))
+    test.assert(not rtcpbuild.rtcp_report(var m, var b, rtcpwire.report_block(1, 0, 0, 0, 0, 0, 0)))
+    test.assert_eq(m.len(), 0)
+    test.assert(not b.ok)
+    test.case("a failed builder refuses until the next compound packet starts")
+    test.assert(not rtcpbuild.rtcp_sdes(var m, var b))
+    test.assert(not rtcpbuild.rtcp_finish(var m, var b))
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    test.assert(b.ok)
+    test.case("a report block with nothing open")
+    test.assert(rtcpbuild.rtcp_finish(var m, var b))
+    test.assert(not rtcpbuild.rtcp_report(var m, var b, rtcpwire.report_block(1, 0, 0, 0, 0, 0, 0)))
+    test.case("the 32nd block")
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    for i in 0..31
+        test.assert(rtcpbuild.rtcp_report(var m, var b, rtcpwire.report_block(i, 0, 0, 0, 0, 0, 0)))
+    test.assert(not rtcpbuild.rtcp_report(var m, var b, rtcpwire.report_block(99, 0, 0, 0, 0, 0, 0)))
+    test.case("31 blocks are a whole packet")
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    for i in 0..31
+        test.assert(rtcpbuild.rtcp_report(var m, var b, rtcpwire.report_block(i, 0, 0, 0, 0, 0, 0)))
+    test.assert(rtcpbuild.rtcp_finish(var m, var b))
+    test.assert_eq(rtpbytes.get_u8(var m, 0), 0x9F)
+    test.assert_eq(rtcpwire.rtcp_check(var m), rtcpwire.RTCP_OK)
+    test.case("a chunk needs an SDES, and an item needs a chunk")
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    test.assert(not rtcpbuild.rtcp_sdes_chunk(var m, var b, 1))
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    test.assert(rtcpbuild.rtcp_sdes(var m, var b))
+    test.assert(not rtcpbuild.rtcp_sdes_item(var m, var b, 1, "x"))
+    test.case("item types 1 to 8 and texts up to 255")
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    test.assert(rtcpbuild.rtcp_sdes(var m, var b))
+    test.assert(rtcpbuild.rtcp_sdes_chunk(var m, var b, 1))
+    test.assert(not rtcpbuild.rtcp_sdes_item(var m, var b, 0, "x"))
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    test.assert(rtcpbuild.rtcp_sdes(var m, var b))
+    test.assert(rtcpbuild.rtcp_sdes_chunk(var m, var b, 1))
+    test.assert(not rtcpbuild.rtcp_sdes_item(var m, var b, 9, "x"))
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    test.assert(rtcpbuild.rtcp_sdes(var m, var b))
+    test.assert(rtcpbuild.rtcp_sdes_chunk(var m, var b, 1))
+    test.assert(rtcpbuild.rtcp_sdes_item(var m, var b, rtcpwire.SDES_PRIV, str.repeat("a", 255)))
+    test.assert(not rtcpbuild.rtcp_sdes_item(var m, var b, 1, str.repeat("a", 256)))
+    test.case("32 chunks")
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    test.assert(rtcpbuild.rtcp_sdes(var m, var b))
+    for i in 0..31
+        test.assert(rtcpbuild.rtcp_sdes_chunk(var m, var b, i))
+    test.assert(not rtcpbuild.rtcp_sdes_chunk(var m, var b, 99))
+    test.case("a BYE reason of 256 bytes")
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    test.assert(not rtcpbuild.rtcp_bye(var m, var b, 1, str.repeat("a", 256)))
+    test.case("an APP subtype above 31, a data count that is not a multiple of four, or too large")
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    test.assert(not rtcpbuild.rtcp_app(var m, var b, 32, 1, 0x41424344, var d, 4))
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    test.assert(not rtcpbuild.rtcp_app(var m, var b, 1, 1, 0x41424344, var d, 3))
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    test.assert(not rtcpbuild.rtcp_app(var m, var b, 1, 1, 0x41424344, var d, 8))
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    test.assert(not rtcpbuild.rtcp_app(var m, var b, 1, 1, 0x41424344, var d, -4))
+    test.case("padding: a multiple of four from 4 to 252, with a packet open")
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    test.assert(not rtcpbuild.rtcp_pad(var m, var b, 3))
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    test.assert(not rtcpbuild.rtcp_pad(var m, var b, 256))
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    test.assert(not rtcpbuild.rtcp_pad(var m, var b, 0))
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    test.assert(rtcpbuild.rtcp_finish(var m, var b))
+    test.assert(not rtcpbuild.rtcp_pad(var m, var b, 4))
+    test.case("padding an SDES ends its chunk first")
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    test.assert(rtcpbuild.rtcp_sdes(var m, var b))
+    test.assert(rtcpbuild.rtcp_sdes_chunk(var m, var b, 1))
+    test.assert(rtcpbuild.rtcp_sdes_item(var m, var b, 1, "ab"))
+    test.assert(rtcpbuild.rtcp_pad(var m, var b, 4))
+    test.assert(rtcpbuild.rtcp_finish(var m, var b))
+
+@test
+fn test_a_full_buffer_is_refused_at_every_step() [io]
+    var m: rtcpwire.RtcpPkt = Vec.new()
+    var b = rtcpbuild.builder()
+    var d: rtpbytes.RtpSmall = Vec.new()
+    for v in [1, 2, 3, 4]
+        let _ = d.push(v as u8)
+    test.case("a packet header")
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    fill_to(var m, 2)
+    test.assert(not rtcpbuild.rtcp_sdes(var m, var b))
+    test.assert_eq(m.len(), 0)
+    test.case("the first packet is closed when the next opens, and the padding may not fit")
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    test.assert(rtcpbuild.rtcp_sdes(var m, var b))
+    test.assert(rtcpbuild.rtcp_sdes_chunk(var m, var b, 1))
+    fill_to(var m, 0)
+    test.assert(not rtcpbuild.rtcp_sdes(var m, var b))
+    test.case("a report block")
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    fill_to(var m, 10)
+    test.assert(not rtcpbuild.rtcp_report(var m, var b, rtcpwire.report_block(1, 0, 0, 0, 0, 0, 0)))
+    test.case("a chunk, the end of the chunk before it, and an item")
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    test.assert(rtcpbuild.rtcp_sdes(var m, var b))
+    fill_to(var m, 2)
+    test.assert(not rtcpbuild.rtcp_sdes_chunk(var m, var b, 1))
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    test.assert(rtcpbuild.rtcp_sdes(var m, var b))
+    test.assert(rtcpbuild.rtcp_sdes_chunk(var m, var b, 1))
+    fill_to(var m, 0)
+    test.assert(not rtcpbuild.rtcp_sdes_chunk(var m, var b, 2))
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    test.assert(rtcpbuild.rtcp_sdes(var m, var b))
+    test.assert(rtcpbuild.rtcp_sdes_chunk(var m, var b, 1))
+    fill_to(var m, 3)
+    test.assert(not rtcpbuild.rtcp_sdes_item(var m, var b, 1, "abc"))
+    test.case("a BYE: the header, the source and the reason")
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    fill_to(var m, 6)
+    test.assert(not rtcpbuild.rtcp_bye(var m, var b, 1, ""))
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    fill_to(var m, 4)
+    test.assert(not rtcpbuild.rtcp_bye(var m, var b, 1, ""))
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    fill_to(var m, 9)
+    test.assert(not rtcpbuild.rtcp_bye(var m, var b, 1, "hello"))
+    test.case("an APP packet's header and its data")
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    fill_to(var m, 2)
+    test.assert(not rtcpbuild.rtcp_app(var m, var b, 1, 1, 0x41424344, var d, 4))
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    fill_to(var m, 14)
+    test.assert(not rtcpbuild.rtcp_app(var m, var b, 1, 1, 0x41424344, var d, 4))
+    test.case("padding")
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    fill_to(var m, 2)
+    test.assert(not rtcpbuild.rtcp_pad(var m, var b, 4))
+    test.case("padding after a chunk that cannot end")
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    test.assert(rtcpbuild.rtcp_sdes(var m, var b))
+    test.assert(rtcpbuild.rtcp_sdes_chunk(var m, var b, 1))
+    fill_to(var m, 0)
+    test.assert(not rtcpbuild.rtcp_pad(var m, var b, 4))
+    test.case("finishing when the last fill does not fit")
+    test.assert(rtcpbuild.rtcp_rr(var m, var b, 1))
+    test.assert(rtcpbuild.rtcp_sdes(var m, var b))
+    test.assert(rtcpbuild.rtcp_sdes_chunk(var m, var b, 1))
+    fill_to(var m, 0)
+    test.assert(not rtcpbuild.rtcp_finish(var m, var b))
+    test.assert_eq(m.len(), 0)
+
+@test
+fn test_the_iterator_stops_at_what_it_cannot_read() [io]
+    test.case("a version other than 2 in a later packet")
+    var a = pkt_of([0x80, 0xC9, 0x00, 0x01, 0, 0, 0, 1, 0x40, 0xC9, 0x00, 0x01, 0, 0, 0, 1])
+    var ia = rtcpwire.rtcp_iter(var a)
+    test.assert(rtcpwire.rtcp_next(var a, var ia))
+    test.assert(not rtcpwire.rtcp_next(var a, var ia))
+    test.assert(ia.fault)
+    test.case("a length that runs past the datagram")
+    var b = pkt_of([0x80, 0xC9, 0x00, 0x05, 0, 0, 0, 1])
+    var ib = rtcpwire.rtcp_iter(var b)
+    test.assert(not rtcpwire.rtcp_next(var b, var ib))
+    test.assert(ib.fault)
+
+@test
+fn test_a_bye_reason_that_runs_past_the_packet_has_no_length() [io]
+    // The reason length byte says 9 and two bytes follow.
+    var m = pkt_of([0x81, 0xCB, 0x00, 0x02, 0, 0, 0, 1, 0x09, 0x61, 0x62, 0x00])
+    var it = rtcpwire.rtcp_iter(var m)
+    test.assert(rtcpwire.rtcp_next(var m, var it))
+    test.assert_eq(rtcpwire.bye_reason_len(var m, it), 0)

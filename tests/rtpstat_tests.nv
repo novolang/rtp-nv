@@ -1,0 +1,473 @@
+// rtpstat_tests.nv — the receiver's bookkeeping, the report interval and
+// the static payload types.
+//
+// THE EXPECTED VALUES ARE WORKED OUT BY HAND from Appendix A and section 6.3
+// of RFC 3550 and from RFC 3551, with the arithmetic in the comment above
+// each case.  Integer division truncates toward zero, as the RFC's C code
+// does.
+
+use std.test
+use rtcptimer
+use rtcpwire
+use rtpstat
+use rtpstatic
+
+// A source that has left probation at `first`: `first - 1` and `first` were
+// the two sequential packets, so `received` is 1 and `base_seq` is `first`.
+fn live(first: Int) -> rtpstat.RtpSource
+    var s = rtpstat.source_new(0xABCD, first - 1, 8000)
+    let _ = rtpstat.source_update(var s, first - 1)
+    let _ = rtpstat.source_update(var s, first)
+    s
+
+@test
+fn test_a_new_source_is_on_probation_until_two_in_a_row() [io]
+    test.case("two sequential packets end it, and only the second is counted")
+    var s = rtpstat.source_new(1, 100, 8000)
+    test.assert(not rtpstat.source_valid(s))
+    test.assert(not rtpstat.source_update(var s, 100))
+    test.assert(not rtpstat.source_valid(s))
+    test.assert(rtpstat.source_update(var s, 101))
+    test.assert(rtpstat.source_valid(s))
+    test.assert_eq(s.received, 1)
+    test.assert_eq(s.base_seq, 101)
+    test.assert_eq(rtpstat.source_expected(s), 1)
+
+    test.case("a gap restarts the probation from the packet that broke it")
+    var t = rtpstat.source_new(1, 100, 8000)
+    test.assert(not rtpstat.source_update(var t, 100))
+    test.assert(not rtpstat.source_update(var t, 105))
+    test.assert(not rtpstat.source_valid(t))
+    test.assert(rtpstat.source_update(var t, 106))
+    test.assert_eq(t.base_seq, 106)
+
+    test.case("a source that starts at sequence 0 has the max one below it, wrapped")
+    var u = rtpstat.source_new(1, 0, 8000)
+    test.assert_eq(u.max_seq, 65535)
+    test.assert(not rtpstat.source_update(var u, 0))
+    test.assert(rtpstat.source_update(var u, 1))
+    test.assert_eq(u.base_seq, 1)
+
+@test
+fn test_sequence_numbers_wrap_into_a_cycle() [io]
+    // Packets 65534, 65535, 0, 1: the cycle count rises when 0 follows 65535.
+    var s = live(65534)
+    test.assert(rtpstat.source_update(var s, 65535))
+    test.assert_eq(s.cycles, 0)
+    test.assert(rtpstat.source_update(var s, 0))
+    test.assert_eq(s.cycles, 65536)
+    test.assert(rtpstat.source_update(var s, 1))
+    test.assert_eq(rtpstat.source_ext_seq(s), 65537)
+    // Expected: 65537 - 65534 + 1 = 4; received: 4.
+    test.assert_eq(rtpstat.source_expected(s), 4)
+    test.assert_eq(s.received, 4)
+    test.assert_eq(rtpstat.source_lost(s), 0)
+
+@test
+fn test_duplicates_late_packets_and_restarts() [io]
+    test.case("a duplicate is counted, so the loss goes negative")
+    var s = live(1000)
+    test.assert(rtpstat.source_update(var s, 1001))
+    test.assert(rtpstat.source_update(var s, 1001))
+    // Expected 2, received 3.
+    test.assert_eq(rtpstat.source_lost(s), -1)
+
+    test.case("a packet a few behind the highest is late and is counted")
+    test.assert(rtpstat.source_update(var s, 1002))
+    test.assert(rtpstat.source_update(var s, 1003))
+    test.assert(rtpstat.source_update(var s, 1000))
+    test.assert_eq(s.max_seq, 1003)
+    test.assert_eq(s.cycles, 0)
+
+    test.case("a jump of 5000 waits for the packet after it to agree")
+    var t = live(2000)
+    test.assert(not rtpstat.source_update(var t, 7000))
+    test.assert_eq(t.bad_seq, 7001)
+    test.assert(rtpstat.source_update(var t, 7001))
+    test.assert_eq(t.base_seq, 7001)
+    test.assert_eq(t.max_seq, 7001)
+    test.assert_eq(t.received, 1)
+
+    test.case("two different jumps in a row restart nothing")
+    var u = live(2000)
+    test.assert(not rtpstat.source_update(var u, 7000))
+    test.assert(not rtpstat.source_update(var u, 9000))
+    test.assert_eq(u.bad_seq, 9001)
+    test.assert_eq(u.base_seq, 2000)
+
+    test.case("a drop of up to 3000 is a lost run, not a restart")
+    var v = live(2000)
+    test.assert(rtpstat.source_update(var v, 4999))
+    test.assert_eq(v.max_seq, 4999)
+    test.assert_eq(rtpstat.source_lost(v), 3000 - 2)
+    test.assert(not rtpstat.source_update(var v, 8000))
+
+@test
+fn test_the_report_block_and_the_fraction_lost() [io]
+    // Packets 1001 to 1005 arrive after the 1000/1001 probation: expected
+    // 1005 - 1001 + 1 = 5, received 5, nothing lost, fraction 0.
+    var s = live(1001)
+    for q in 1002..1006
+        let _ = rtpstat.source_update(var s, q)
+    let r1 = rtpstat.source_report(var s, 0)
+    test.assert_eq(r1.ssrc, 0xABCD)
+    test.assert_eq(r1.ext_seq, 1005)
+    test.assert_eq(r1.lost, 0)
+    test.assert_eq(r1.fraction, 0)
+    test.assert_eq(r1.lsr, 0)
+    test.assert_eq(r1.dlsr, 0)
+
+    // Then 1006, 1008 and 1010 arrive: expected 10 - 5 = 5 in the interval,
+    // received 3, lost 2, fraction (2 << 8) / 5 = 102.  Cumulative: expected
+    // 10, received 8, lost 2.
+    for q in [1006, 1008, 1010]
+        let _ = rtpstat.source_update(var s, q)
+    let r2 = rtpstat.source_report(var s, 0)
+    test.assert_eq(r2.lost, 2)
+    test.assert_eq(r2.fraction, 102)
+    test.assert_eq(r2.ext_seq, 1010)
+
+    test.case("a report with no packets since the last has fraction 0")
+    let r3 = rtpstat.source_report(var s, 0)
+    test.assert_eq(r3.fraction, 0)
+
+    test.case("the last SR and the delay since it, in 1/65536 seconds")
+    // An SR at NTP 0x1234ABCD.89EF0000 arrived at 1000 ms.  The middle 32
+    // bits are 0xABCD89EF.  At 2500 ms the delay is 1.5 s = 98304 = 0x18000.
+    rtpstat.source_sr(var s, 0x1234ABCD, 0x89EF0000, 1000)
+    let r4 = rtpstat.source_report(var s, 2500)
+    test.assert_eq(r4.lsr, 0xABCD89EF)
+    test.assert_eq(r4.dlsr, 0x18000)
+
+    test.case("the cumulative loss is held to the 24-bit signed range")
+    // 200 cycles of 65536 expected and only 5 received: 13,107,200 - ... is
+    // above 0x7FFFFF = 8,388,607.
+    let big = rtpstat.RtpSource { ssrc: 1, clock: 8000, max_seq: 10, cycles: 65536 * 200,
+                                  base_seq: 10, bad_seq: 65537, probation: 0, received: 5,
+                                  expected_prior: 0, received_prior: 0, transit: 0,
+                                  has_transit: false, jitter: 0, lsr: 0, lsr_at_ms: -1 }
+    var b1 = big
+    test.assert_eq(rtpstat.source_report(var b1, 0).lost, 0x7FFFFF)
+    // Received far more than expected: lost is negative past the field.
+    let neg = rtpstat.RtpSource { ssrc: 1, clock: 8000, max_seq: 10, cycles: 0, base_seq: 10,
+                                  bad_seq: 65537, probation: 0, received: 20000000,
+                                  expected_prior: 0, received_prior: 0, transit: 0,
+                                  has_transit: false, jitter: 0, lsr: 0, lsr_at_ms: -1 }
+    var b2 = neg
+    test.assert_eq(rtpstat.source_report(var b2, 0).lost, -8388608)
+
+    test.case("a fraction of 256ths is held to 255 when nothing arrived in the interval")
+    // Expected 1 in the interval, received 0: (1 << 8) / 1 = 256, held to 255.
+    let none = rtpstat.RtpSource { ssrc: 1, clock: 8000, max_seq: 10, cycles: 0, base_seq: 10,
+                                   bad_seq: 65537, probation: 0, received: 0, expected_prior: 0,
+                                   received_prior: 0, transit: 0, has_transit: false, jitter: 0,
+                                   lsr: 0, lsr_at_ms: -1 }
+    var b3 = none
+    test.assert_eq(rtpstat.source_report(var b3, 0).fraction, 255)
+
+@test
+fn test_interarrival_jitter() [io]
+    // Three packets, 20 ms apart in an 8000 Hz clock (160 units).  Arrivals
+    // at 1000, 1176 and 1300 units; timestamps 0, 160, 320.
+    // transit = arrival - timestamp: 1000, 1016, 980.
+    // D(1,2) = 16: J = 0 + 16 - ((0 + 8) >> 4) = 16, reported 16 >> 4 = 1.
+    // D(2,3) = |980 - 1016| = 36: J = 16 + 36 - ((16 + 8) >> 4) = 51,
+    // reported 51 >> 4 = 3.
+    var s = rtpstat.source_new(1, 0, 8000)
+    rtpstat.source_arrival(var s, 1000, 0)
+    test.assert_eq(s.jitter, 0)
+    rtpstat.source_arrival(var s, 1176, 160)
+    test.assert_eq(s.jitter, 16)
+    test.assert_eq(rtpstat.source_jitter(s), 1)
+    rtpstat.source_arrival(var s, 1300, 320)
+    test.assert_eq(s.jitter, 51)
+    test.assert_eq(rtpstat.source_jitter(s), 3)
+
+    test.case("an arrival earlier than the pace makes a negative difference, taken as magnitude")
+    var t = rtpstat.source_new(1, 0, 8000)
+    rtpstat.source_arrival(var t, 1000, 0)
+    rtpstat.source_arrival(var t, 1100, 160)
+    // transit 1000 then 940: D = -60, magnitude 60: J = 0 + 60 - 0 = 60.
+    test.assert_eq(t.jitter, 60)
+
+    test.case("a timestamp that wraps does not move the estimate")
+    // Packet 1: timestamp 0xFFFFFFF0 at arrival 10: transit 10 - 0xFFFFFFF0
+    // is -4294967270, which is 26 modulo 2^32.  Packet 2: timestamp 0x10 at
+    // arrival 36: transit 36 - 16 = 20.
+    var w = rtpstat.source_new(1, 0, 8000)
+    rtpstat.source_arrival(var w, 10, 0xFFFFFFF0)
+    test.assert_eq(w.transit, 26)
+    rtpstat.source_arrival(var w, 36, 0x10)
+    test.assert_eq(w.transit, 20)
+    // D = |20 - 26| = 6: J = 0 + 6 - 0 = 6.
+    test.assert_eq(w.jitter, 6)
+
+    test.case("the report carries the jitter")
+    var r = live(5)
+    rtpstat.source_arrival(var r, 1000, 0)
+    rtpstat.source_arrival(var r, 1176, 160)
+    rtpstat.source_arrival(var r, 1300, 320)
+    test.assert_eq(rtpstat.source_report(var r, 0).jitter, 3)
+
+    test.case("milliseconds to clock units")
+    test.assert_eq(rtpstat.ms_to_units(20, 8000), 160)
+    test.assert_eq(rtpstat.ms_to_units(33, 90000), 2970)
+
+@test
+fn test_ntp_times_and_the_round_trip() [io]
+    test.case("the middle 32 bits of an NTP time")
+    test.assert_eq(rtpstat.ntp_middle(0x1234ABCD, 0x89EF1234), 0xABCD89EF)
+    test.case("an instant given in milliseconds since 1900")
+    // 1500 ms is 1 s and half a second, which is 2^31 in 2^-32 seconds.
+    test.assert_eq(rtpstat.ntp_hi_of_ms(1500), 1)
+    test.assert_eq(rtpstat.ntp_lo_of_ms(1500), 0x80000000)
+    test.assert_eq(rtpstat.ntp_hi_of_ms(0), 0)
+    test.assert_eq(rtpstat.ntp_lo_of_ms(0), 0)
+    // 4294967296 s wraps in the 32-bit seconds field.
+    test.assert_eq(rtpstat.ntp_hi_of_ms(4294967296000 + 2000), 2)
+
+    test.case("the round trip: arrival minus LSR minus DLSR")
+    // Our SR left at middle time 0x00010000; the report block came back at
+    // 0x00018000; the peer held it 0x4000 (a quarter second): the round trip
+    // is 0x8000 - 0x4000 = 0x4000 = 16384 units, 250 ms.
+    test.assert_eq(rtpstat.rtt_units(0x00018000, 0x00010000, 0x4000), 0x4000)
+    test.assert_eq(rtpstat.rtt_ms(0x00018000, 0x00010000, 0x4000), 250)
+    test.case("no LSR means the peer has heard no SR from us")
+    test.assert_eq(rtpstat.rtt_units(0x00018000, 0, 0), -1)
+    test.assert_eq(rtpstat.rtt_ms(0x00018000, 0, 0), -1)
+    test.case("the subtraction wraps at 2^32")
+    // Now is 0x00000100 after wrapping; the SR left at 0xFFFFFF00: 0x200.
+    test.assert_eq(rtpstat.rtt_units(0x100, 0xFFFFFF00, 0), 0x200)
+
+@test
+fn test_a_sender_counts_packets_and_octets() [io]
+    var s = rtpstat.sender_new()
+    rtpstat.sender_on_packet(var s, 160)
+    rtpstat.sender_on_packet(var s, 160)
+    test.assert_eq(s.packets, 2)
+    test.assert_eq(s.octets, 320)
+    test.case("the counts are 32 bits")
+    let full = rtpstat.RtpSender { packets: 0xFFFFFFFF, octets: 0xFFFFFFFF }
+    var f = full
+    rtpstat.sender_on_packet(var f, 2)
+    test.assert_eq(f.packets, 0)
+    test.assert_eq(f.octets, 1)
+
+@test
+fn test_the_report_interval() [io]
+    // Td = avg_rtcp_size * n / rtcp_bw, floored at 5 s (2.5 s at first), then
+    // times (0.5 + draw / 1000) and divided by 1.21828.  Everything in
+    // milliseconds with integer division.  400 bytes a second is 5 % of a
+    // 64 kbit/s session.
+    test.assert_eq(rtcptimer.rtcp_bandwidth(64000), 400)
+    test.case("100 members, 100-byte packets: Td 25 s")
+    test.assert_eq(rtcptimer.rtcp_interval(100, 0, 400, false, 100, false, 500), 20520)
+    test.assert_eq(rtcptimer.rtcp_interval(100, 0, 400, false, 100, false, 0), 10260)
+    test.assert_eq(rtcptimer.rtcp_interval(100, 0, 400, false, 100, false, 1000), 30781)
+    test.case("a draw outside 0 to 1000 is held to it")
+    test.assert_eq(rtcptimer.rtcp_interval(100, 0, 400, false, 100, false, -5), 10260)
+    test.assert_eq(rtcptimer.rtcp_interval(100, 0, 400, false, 100, false, 5000), 30781)
+    test.case("fewer than a quarter of the members send")
+    // We send: 25 % of the bandwidth shared by the 10 senders: Td =
+    // 100 * 10 / (400 / 4) = 10 s.
+    test.assert_eq(rtcptimer.rtcp_interval(100, 10, 400, true, 100, false, 500), 8208)
+    // We receive: 75 % shared by the 90 others: Td = 100 * 90 / 300 = 30 s.
+    test.assert_eq(rtcptimer.rtcp_interval(100, 10, 400, false, 100, false, 500), 24624)
+    test.case("a quarter or more send: everyone shares the whole")
+    test.assert_eq(rtcptimer.rtcp_interval(100, 25, 400, false, 100, false, 500), 20520)
+    test.case("the floor: 5 s, and 2.5 s before the first packet")
+    test.assert_eq(rtcptimer.rtcp_interval(1, 0, 400, false, 100, false, 500), 4104)
+    test.assert_eq(rtcptimer.rtcp_interval(1, 0, 400, false, 100, true, 500), 2052)
+    test.case("a bandwidth of zero is read as one byte a second")
+    test.assert_eq(rtcptimer.rtcp_interval(100, 0, 0, false, 100, false, 500), 8208293)
+
+@test
+fn test_the_timer_sends_after_reconsidering() [io]
+    var t = rtcptimer.timer_new(400, 100, 0, 500)
+    test.assert_eq(rtcptimer.timer_due(t), 2052)
+    test.assert_eq(t.members, 1)
+    test.assert(t.initial)
+
+    test.case("before the due time: wait")
+    test.assert_eq(rtcptimer.timer_check(var t, 2051, 500), rtcptimer.RTCP_WAIT)
+    test.case("at the due time with nothing changed: send")
+    test.assert_eq(rtcptimer.timer_check(var t, 2052, 500), rtcptimer.RTCP_SEND)
+
+    test.case("at the due time with 100 members now: reconsider and wait")
+    // Td for 100 members at the initial floor is 25 s, so the interval is
+    // 20520 ms from the last send (0).
+    rtcptimer.timer_members_changed(var t, 1000, 100, 0)
+    test.assert_eq(rtcptimer.timer_check(var t, 2052, 500), rtcptimer.RTCP_WAIT)
+    test.assert_eq(rtcptimer.timer_due(t), 20520)
+    test.assert_eq(rtcptimer.timer_check(var t, 20519, 500), rtcptimer.RTCP_WAIT)
+    test.assert_eq(rtcptimer.timer_check(var t, 20520, 500), rtcptimer.RTCP_SEND)
+
+    test.case("sending: the average, the last send time and the next due time")
+    // avg16 = 60 + 15 * 1600 / 16 = 1560, an average of 97 bytes; Td =
+    // 97 * 100 / 400 = 24.25 s, 19904 ms after the factor: 20520 + 19904.
+    rtcptimer.timer_sent(var t, 60, 20520, 500)
+    test.assert_eq(t.avg16, 1560)
+    test.assert(not t.initial)
+    test.assert_eq(t.pmembers, 100)
+    test.assert_eq(t.tp, 20520)
+    test.assert_eq(rtcptimer.timer_due(t), 40425)
+
+    test.case("a packet heard moves the average")
+    rtcptimer.timer_heard(var t, 200)
+    test.assert_eq(t.avg16, 1662)
+
+    test.case("members leaving pull the timer in by the ratio")
+    // At 30000 ms with 50 of the 100 left: next = 30000 + 50 * (40425 -
+    // 30000) / 100 = 35212; last = 30000 - 50 * (30000 - 20520) / 100 = 25260.
+    rtcptimer.timer_members_changed(var t, 30000, 50, 0)
+    test.assert_eq(rtcptimer.timer_due(t), 35212)
+    test.assert_eq(t.tp, 25260)
+    test.assert_eq(t.pmembers, 50)
+    test.assert_eq(t.members, 50)
+
+    test.case("members joining change the count and not the schedule")
+    rtcptimer.timer_members_changed(var t, 31000, 60, 3)
+    test.assert_eq(t.members, 60)
+    test.assert_eq(t.senders, 3)
+    test.assert_eq(t.pmembers, 50)
+    test.assert_eq(rtcptimer.timer_due(t), 35212)
+
+    test.case("this member sending")
+    rtcptimer.timer_we_sent(var t, true)
+    test.assert(t.we_sent)
+
+@test
+fn test_a_bye_waits_as_though_alone() [io]
+    var t = rtcptimer.timer_new(400, 100, 0, 500)
+    rtcptimer.timer_members_changed(var t, 0, 200, 20)
+    rtcptimer.timer_we_sent(var t, true)
+    rtcptimer.timer_bye(var t, 28, 50000, 500)
+    test.assert_eq(t.members, 1)
+    test.assert_eq(t.pmembers, 1)
+    test.assert_eq(t.senders, 0)
+    test.assert(not t.we_sent)
+    test.assert(t.initial)
+    test.assert_eq(t.avg16, 448)
+    test.assert_eq(rtcptimer.timer_due(t), 52052)
+    test.case("a BYE heard counts one more member and moves the average")
+    rtcptimer.timer_bye_heard(var t, 28)
+    test.assert_eq(t.members, 2)
+    test.assert_eq(t.avg16, 448)
+
+@test
+fn test_static_payload_types_of_rfc_3551() [io]
+    test.case("kinds across the whole range")
+    test.assert_eq(rtpstatic.pt_kind(0), rtpstatic.RTP_KIND_AUDIO)
+    test.assert_eq(rtpstatic.pt_kind(1), rtpstatic.RTP_KIND_RESERVED)
+    test.assert_eq(rtpstatic.pt_kind(2), rtpstatic.RTP_KIND_RESERVED)
+    test.assert_eq(rtpstatic.pt_kind(3), rtpstatic.RTP_KIND_AUDIO)
+    test.assert_eq(rtpstatic.pt_kind(18), rtpstatic.RTP_KIND_AUDIO)
+    test.assert_eq(rtpstatic.pt_kind(19), rtpstatic.RTP_KIND_RESERVED)
+    test.assert_eq(rtpstatic.pt_kind(20), rtpstatic.RTP_KIND_UNASSIGNED)
+    test.assert_eq(rtpstatic.pt_kind(25), rtpstatic.RTP_KIND_VIDEO)
+    test.assert_eq(rtpstatic.pt_kind(26), rtpstatic.RTP_KIND_VIDEO)
+    test.assert_eq(rtpstatic.pt_kind(27), rtpstatic.RTP_KIND_UNASSIGNED)
+    test.assert_eq(rtpstatic.pt_kind(28), rtpstatic.RTP_KIND_VIDEO)
+    test.assert_eq(rtpstatic.pt_kind(29), rtpstatic.RTP_KIND_UNASSIGNED)
+    test.assert_eq(rtpstatic.pt_kind(31), rtpstatic.RTP_KIND_VIDEO)
+    test.assert_eq(rtpstatic.pt_kind(32), rtpstatic.RTP_KIND_VIDEO)
+    test.assert_eq(rtpstatic.pt_kind(33), rtpstatic.RTP_KIND_AUDIOVIDEO)
+    test.assert_eq(rtpstatic.pt_kind(34), rtpstatic.RTP_KIND_VIDEO)
+    test.assert_eq(rtpstatic.pt_kind(35), rtpstatic.RTP_KIND_UNASSIGNED)
+    test.assert_eq(rtpstatic.pt_kind(72), rtpstatic.RTP_KIND_RESERVED)
+    test.assert_eq(rtpstatic.pt_kind(76), rtpstatic.RTP_KIND_RESERVED)
+    test.assert_eq(rtpstatic.pt_kind(77), rtpstatic.RTP_KIND_UNASSIGNED)
+    test.assert_eq(rtpstatic.pt_kind(95), rtpstatic.RTP_KIND_UNASSIGNED)
+    test.assert_eq(rtpstatic.pt_kind(96), rtpstatic.RTP_KIND_DYNAMIC)
+    test.assert_eq(rtpstatic.pt_kind(127), rtpstatic.RTP_KIND_DYNAMIC)
+    test.assert_eq(rtpstatic.pt_kind(128), rtpstatic.RTP_KIND_UNASSIGNED)
+    test.assert_eq(rtpstatic.pt_kind(-1), rtpstatic.RTP_KIND_UNASSIGNED)
+    test.assert(rtpstatic.pt_is_static(0))
+    test.assert(rtpstatic.pt_is_static(95))
+    test.assert(not rtpstatic.pt_is_static(96))
+    test.assert(not rtpstatic.pt_is_static(-1))
+    test.assert(rtpstatic.pt_is_dynamic(96))
+    test.assert(rtpstatic.pt_is_dynamic(127))
+    test.assert(not rtpstatic.pt_is_dynamic(95))
+    test.assert(not rtpstatic.pt_is_dynamic(128))
+
+    test.case("names, clock rates and channels of every assigned type (RFC 3551 tables 4 and 5)")
+    test.assert_eq(rtpstatic.pt_name(0), "PCMU")
+    test.assert_eq(rtpstatic.pt_clock(0), 8000)
+    test.assert_eq(rtpstatic.pt_channels(0), 1)
+    test.assert_eq(rtpstatic.pt_name(3), "GSM")
+    test.assert_eq(rtpstatic.pt_name(4), "G723")
+    test.assert_eq(rtpstatic.pt_name(5), "DVI4")
+    test.assert_eq(rtpstatic.pt_clock(5), 8000)
+    test.assert_eq(rtpstatic.pt_name(6), "DVI4")
+    test.assert_eq(rtpstatic.pt_clock(6), 16000)
+    test.assert_eq(rtpstatic.pt_name(7), "LPC")
+    test.assert_eq(rtpstatic.pt_name(8), "PCMA")
+    test.assert_eq(rtpstatic.pt_name(9), "G722")
+    test.assert_eq(rtpstatic.pt_clock(9), 8000)
+    test.assert_eq(rtpstatic.pt_name(10), "L16")
+    test.assert_eq(rtpstatic.pt_clock(10), 44100)
+    test.assert_eq(rtpstatic.pt_channels(10), 2)
+    test.assert_eq(rtpstatic.pt_name(11), "L16")
+    test.assert_eq(rtpstatic.pt_channels(11), 1)
+    test.assert_eq(rtpstatic.pt_name(12), "QCELP")
+    test.assert_eq(rtpstatic.pt_name(13), "CN")
+    test.assert_eq(rtpstatic.pt_name(14), "MPA")
+    test.assert_eq(rtpstatic.pt_clock(14), 90000)
+    test.assert_eq(rtpstatic.pt_name(15), "G728")
+    test.assert_eq(rtpstatic.pt_name(16), "DVI4")
+    test.assert_eq(rtpstatic.pt_clock(16), 11025)
+    test.assert_eq(rtpstatic.pt_name(17), "DVI4")
+    test.assert_eq(rtpstatic.pt_clock(17), 22050)
+    test.assert_eq(rtpstatic.pt_name(18), "G729")
+    test.assert_eq(rtpstatic.pt_name(25), "CelB")
+    test.assert_eq(rtpstatic.pt_clock(25), 90000)
+    test.assert_eq(rtpstatic.pt_name(26), "JPEG")
+    test.assert_eq(rtpstatic.pt_name(28), "nv")
+    test.assert_eq(rtpstatic.pt_name(31), "H261")
+    test.assert_eq(rtpstatic.pt_name(32), "MPV")
+    test.assert_eq(rtpstatic.pt_name(33), "MP2T")
+    test.assert_eq(rtpstatic.pt_name(34), "H263")
+    test.assert_eq(rtpstatic.pt_clock(34), 90000)
+
+    test.case("a type with no name has no clock and no channels")
+    test.assert_eq(rtpstatic.pt_name(1), "")
+    test.assert_eq(rtpstatic.pt_name(96), "")
+    test.assert_eq(rtpstatic.pt_clock(96), -1)
+    test.assert_eq(rtpstatic.pt_clock(1), -1)
+    test.assert_eq(rtpstatic.pt_channels(96), 0)
+    test.assert_eq(rtpstatic.pt_channels(26), 0)
+    test.assert_eq(rtpstatic.pt_channels(1), 0)
+
+    test.case("the constants")
+    test.assert_eq(rtpstatic.RTP_PT_PCMU, 0)
+    test.assert_eq(rtpstatic.pt_name(rtpstatic.RTP_PT_GSM), "GSM")
+    test.assert_eq(rtpstatic.pt_name(rtpstatic.RTP_PT_PCMA), "PCMA")
+    test.assert_eq(rtpstatic.pt_name(rtpstatic.RTP_PT_G722), "G722")
+    test.assert_eq(rtpstatic.pt_name(rtpstatic.RTP_PT_CN), "CN")
+    test.assert_eq(rtpstatic.pt_name(rtpstatic.RTP_PT_JPEG), "JPEG")
+    test.assert_eq(rtpstatic.pt_name(rtpstatic.RTP_PT_H261), "H261")
+    test.assert_eq(rtpstatic.pt_name(rtpstatic.RTP_PT_MP2T), "MP2T")
+
+@test
+fn test_names_compare_without_case_and_resolve_to_a_type() [io]
+    test.assert(rtpstatic.name_eq("pcmu", "PCMU"))
+    test.assert(rtpstatic.name_eq("PCMU", "pcmu"))
+    test.assert(rtpstatic.name_eq("CelB", "celb"))
+    test.assert(rtpstatic.name_eq("nv", "NV"))
+    test.assert(not rtpstatic.name_eq("PCM", "PCMU"))
+    test.assert(not rtpstatic.name_eq("PCMA", "PCMU"))
+    test.assert(not rtpstatic.name_eq("pcmu", "PCMA"))
+    test.assert(not rtpstatic.name_eq("PCMA", "pcmu"))
+    test.case("lookup by name, clock and channels")
+    test.assert_eq(rtpstatic.pt_lookup("PCMU", 8000, 1), 0)
+    test.assert_eq(rtpstatic.pt_lookup("pcma", 8000, 1), 8)
+    test.assert_eq(rtpstatic.pt_lookup("G722", 8000, 1), 9)
+    test.assert_eq(rtpstatic.pt_lookup("L16", 44100, 2), 10)
+    test.assert_eq(rtpstatic.pt_lookup("L16", 44100, 1), 11)
+    test.assert_eq(rtpstatic.pt_lookup("DVI4", 16000, 1), 6)
+    test.assert_eq(rtpstatic.pt_lookup("H264", 90000, 1), -1)
+    test.assert_eq(rtpstatic.pt_lookup("opus", 48000, 2), -1)
+    test.assert_eq(rtpstatic.pt_lookup("PCMU", 16000, 1), -1)
+    test.assert_eq(rtpstatic.pt_lookup("PCMU", 8000, 2), -1)
+    test.assert_eq(rtpstatic.pt_lookup("JPEG", 90000, 1), 26)

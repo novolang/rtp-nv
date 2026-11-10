@@ -1,0 +1,24 @@
+[package]
+name        = "rtp-nv"
+version     = "0.1.0"
+description = "RTP and RTCP for novo-lang, RFC 3550: the RTP packet with its CSRC list and the header extensions of RFC 8285, the RTCP sender and receiver reports, source descriptions, BYE and APP, the validity check of Appendix A.2, the receiver's sequence, loss and jitter bookkeeping of Appendix A, the report interval of section 6.3 as a step a caller drives, and the static payload types of RFC 3551. Over buffers the caller owns, with no allocation and no sockets."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "networking"
+layer       = "core"
+tags        = ["rtp", "rtcp", "rfc3550", "rfc3551", "rfc8285", "audio", "video", "streaming", "embedded", "sans-io", "no-alloc"]
+repository  = "https://github.com/novolang/rtp-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.23.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "RTP and RTCP for a device that streams, as steps the caller drives"
+
+[dependencies]
+# None.  A packet is bytes in a buffer the caller owns, and the state of a
+# source, of a report interval and of a header extension is integers.  The
+# codecs a payload carries are another package's: this one carries the
+# payload as bytes it does not read.

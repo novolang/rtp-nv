@@ -1,0 +1,174 @@
+// tests/embedded_probe.nv — this package's device claim, as a program
+// that either builds for a Cortex-M or does not.
+//
+// THE CONSUMER IS A NETWORKED MICROPHONE: a Cortex-M that sends 20 ms
+// frames of G.711 as RTP, reports on the stream with RTCP, listens to a
+// peer's stream and its reports, and decides when to send the next report,
+// all with no heap.  Everything it decides is here and is compiled for the
+// hardware rather than claimed.  The datagram socket is the caller's, so the
+// probe passes the packets between the two ends in memory.
+//
+// What it checks, with the number of checks each adds:
+//
+//   - an RTP packet built with a CSRC and a one-byte header extension, then
+//     read back (5)
+//   - a compound RTCP packet (SR with a report block, SDES, BYE) built, passed
+//     through the validity check and read (5)
+//   - a receiver taking packets across a sequence wrap, with one lost, and
+//     reporting loss and jitter (4)
+//   - the round trip worked out from a report block (1)
+//   - the report timer waiting, sending and reconsidering (3)
+//   - a payload type looked up in the static table (2)
+//
+// The score is the sum, and a device that disagrees with the host prints how
+// many it lost.
+
+use std.str
+use rtcpbuild
+use rtcptimer
+use rtcpwire
+use rtpbytes
+use rtpstat
+use rtpstatic
+use rtpwire
+
+// A packet with a CSRC, a one-byte extension and four payload bytes, read
+// back: five checks.
+@tier(embedded)
+@no_alloc
+fn packet_score() -> Int []
+    var n = 0
+    var p: RtpPkt = Vec.new()
+    var b = rtpwire.builder()
+    var d: rtpbytes.RtpSmall = Vec.new()
+    let _ = d.push(0x7F as u8)
+    let ok = rtpwire.begin(var p, var b, true, 0, 1000, 160, 0xDEADBEEF)
+        and rtpwire.add_csrc(var p, var b, 7)
+        and rtpwire.ext_begin(var p, var b, rtpwire.RTP_EXT_ONE_BYTE)
+        and rtpwire.ext_add(var p, var b, 1, var d, 1)
+        and rtpwire.ext_end(var p, var b)
+        and rtpwire.push_payload_str(var p, var b, "G711")
+    if ok and p.len() == 12 + 4 + 8 + 4
+        n = n + 1
+    let h = rtpwire.parse(var p)
+    if rtpwire.header_ok(h) and h.marker and h.seq == 1000 and h.csrc_count == 1
+        n = n + 1
+    if rtpwire.csrc(var p, h, 0) == 7 and h.payload_len == 4
+        n = n + 1
+    let e = rtpwire.ext_find(var p, h, 1)
+    if e.data_len == 1 and rtpbytes.get_u8(var p, e.data_off) == 0x7F
+        n = n + 1
+    if rtpwire.ext_find(var p, h, 2).data_len == -1
+        n = n + 1
+    n
+
+// A compound RTCP packet: five checks.
+@tier(embedded)
+@no_alloc
+fn rtcp_score() -> Int []
+    var n = 0
+    var m: RtcpPkt = Vec.new()
+    var b = rtcpbuild.builder()
+    let ok = rtcpbuild.rtcp_sr(var m, var b, 1, 0xE0000000, 0x80000000, 800, 5, 800)
+        and rtcpbuild.rtcp_report(var m, var b,
+            rtcpwire.report_block(2, 64, 3, 0x00010005, 16, 0xE0008000, 0x00018000))
+        and rtcpbuild.rtcp_sdes(var m, var b)
+        and rtcpbuild.rtcp_sdes_chunk(var m, var b, 1)
+        and rtcpbuild.rtcp_sdes_item(var m, var b, rtcpwire.SDES_CNAME, "mic@node")
+        and rtcpbuild.rtcp_bye(var m, var b, 1, "bye")
+        and rtcpbuild.rtcp_finish(var m, var b)
+    if ok
+        n = n + 1
+    if rtcpwire.rtcp_check(var m) == rtcpwire.RTCP_OK
+        n = n + 1
+    var it = rtcpwire.rtcp_iter(var m)
+    if rtcpwire.rtcp_next(var m, var it) and it.pt == rtcpwire.RTCP_SR
+        and rtcpwire.read_block(var m, it, 0).lost == 3
+        n = n + 1
+    if rtcpwire.rtcp_next(var m, var it) and it.pt == rtcpwire.RTCP_SDES
+        n = n + 1
+    if rtcpwire.rtcp_next(var m, var it) and rtcpwire.bye_reason_len(var m, it) == 3
+        n = n + 1
+    n
+
+// A receiver across a sequence wrap, with 65535 lost: four checks.
+@tier(embedded)
+@no_alloc
+fn receiver_score() -> Int []
+    var n = 0
+    var s = rtpstat.source_new(1, 65533, 8000)
+    let _ = rtpstat.source_update(var s, 65533)
+    let _ = rtpstat.source_update(var s, 65534)
+    let _ = rtpstat.source_update(var s, 0)
+    let _ = rtpstat.source_update(var s, 1)
+    let _ = rtpstat.source_update(var s, 3)
+    // Counted: 65534, 0, 1 and 3; base 65534; extended highest 65536 + 3.
+    if rtpstat.source_valid(s) and s.cycles == 65536
+        n = n + 1
+    if rtpstat.source_expected(s) == 6 and rtpstat.source_lost(s) == 2
+        n = n + 1
+    rtpstat.source_arrival(var s, 1000, 0)
+    rtpstat.source_arrival(var s, 1176, 160)
+    rtpstat.source_arrival(var s, 1300, 320)
+    let r = rtpstat.source_report(var s, 0)
+    if r.jitter == 3 and r.lost == 2
+        n = n + 1
+    if r.ext_seq == 65539 and r.fraction == 85
+        n = n + 1
+    n
+
+// A report block coming back: one check.
+@tier(embedded)
+@no_alloc
+fn rtt_score() -> Int []
+    if rtpstat.rtt_ms(0x00018000, 0x00010000, 0x4000) == 250
+        return 1
+    0
+
+// The report timer: three checks.
+@tier(embedded)
+@no_alloc
+fn timer_score() -> Int []
+    var n = 0
+    var t = rtcptimer.timer_new(400, 100, 0, 500)
+    if rtcptimer.timer_check(var t, 2051, 500) == rtcptimer.RTCP_WAIT
+        n = n + 1
+    if rtcptimer.timer_check(var t, 2052, 500) == rtcptimer.RTCP_SEND
+        n = n + 1
+    rtcptimer.timer_sent(var t, 60, 2052, 500)
+    if rtcptimer.timer_due(t) > 2052 + 2500
+        n = n + 1
+    n
+
+// A static payload type: two checks.
+@tier(embedded)
+@no_alloc
+fn static_score() -> Int []
+    var n = 0
+    if rtpstatic.pt_lookup("PCMA", 8000, 1) == 8
+        n = n + 1
+    if rtpstatic.pt_kind(96) == rtpstatic.RTP_KIND_DYNAMIC
+        n = n + 1
+    n
+
+// Every answer this probe checks, folded into one number so a single
+// comparison decides the run.
+@tier(embedded)
+fn score() -> Int []
+    packet_score() + rtcp_score() + receiver_score() + rtt_score() + timer_score() + static_score()
+
+@tier(rt)
+fn main() [hw]
+    bsp.board.init()
+    // 20 is the number of checks in `score`.  The count is printed on a
+    // failure rather than only compared, so a device that disagrees with
+    // the host says how many it lost.
+    let n = score()
+    if n == 20
+        hal.uart.write("PASS: rtp-embedded\n")
+    else
+        hal.uart.write("FAIL: rtp-embedded score=")
+        hal.uart.write(str.from_int(n))
+        hal.uart.write("\n")
+    loop
+        hal.timer.delay_ms(1000)

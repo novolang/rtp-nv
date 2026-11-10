@@ -1,0 +1,372 @@
+// rtpstat.nv — what a receiver keeps about each source it hears, and what a
+// sender keeps about itself: Appendix A of RFC 3550 and the round trip of
+// section 6.4.1.  No allocation.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  The state of one
+// source is an `RtpSource`, a `@value` the caller holds, one for every SSRC
+// it listens to.  The package has no clock: the caller says when a packet
+// arrived, in the units named at each function, and when a report is made.
+//
+// THE EXTENDED SEQUENCE NUMBER.  The sequence number in a packet is 16 bits
+// and wraps in about 22 minutes of 50-packet-a-second audio.  A receiver
+// counts the wraps in `cycles` and reports 32 bits: the cycle count in the
+// high 16 and the highest sequence number in the low 16.  Deciding that a
+// number "after" the highest is a new packet, that a number far behind it is
+// a late one, and that a number far ahead is a source that restarted, is the
+// rule of Appendix A.1 and is `source_update`.
+//
+// THE PROBATION.  A source is not believed until two packets with
+// consecutive sequence numbers have arrived (`RTP_MIN_SEQUENTIAL`), so that
+// a stray packet from a port scan does not make a member of the session.
+// `source_update` answers false until then.  The packet that ended the
+// probation is the first one counted: the earlier one is not, which is why
+// `received` and `base_seq` begin there, as in the RFC's C code.
+//
+// LOSS.  Expected packets are the extended highest sequence minus the base
+// plus one; lost is expected minus received, and may be negative when
+// duplicates arrive.  The fraction lost in a report is the loss over the
+// interval since the previous report, in 256ths (A.3).
+//
+// JITTER (A.8).  For two packets i and j the difference in relative transit
+// time is D(i, j) = (Rj - Ri) - (Sj - Si), with R the arrival time and S the
+// RTP timestamp, both in the clock of the payload.  The estimate J moves a
+// sixteenth of the way toward |D| at each packet.  It is kept scaled by 16,
+// as the RFC's integer code does, so the reported value is `jitter >> 4`.
+// The arrival time is the caller's, already converted to clock units;
+// `ms_to_units` does the conversion.
+//
+// THE ROUND TRIP (6.4.1).  A sender report carries an NTP time.  The
+// receiver keeps its middle 32 bits (LSR) and the time it arrived.  In its
+// next report it sends the LSR back with the time that has passed since, in
+// 1/65536 seconds (DLSR).  The sender subtracts both from the NTP time at
+// which that report arrived; what is left is the round trip.
+
+use rtcpwire
+use rtpbytes
+
+// The number of sequence numbers: 65536.
+pub const RTP_SEQ_MOD = 65536
+// The largest forward jump in sequence numbers that is taken as a lost run
+// of packets and not a restart of the source: 3000.
+pub const RTP_MAX_DROPOUT = 3000
+// The largest step back that is taken as a late packet and not a restart: 100.
+pub const RTP_MAX_MISORDER = 100
+// How many packets in sequence end the probation of a new source: 2.
+pub const RTP_MIN_SEQUENTIAL = 2
+
+// What a receiver keeps about one source.
+pub @value
+struct RtpSource
+    // The SSRC of the source.
+    ssrc: Int
+    // The clock rate of the payload, in Hz, that arrival times are counted in.
+    clock: Int
+    // The highest sequence number received, 16 bits.
+    max_seq: Int
+    // The count of sequence wraps, shifted: a multiple of 65536.
+    cycles: Int
+    // The first sequence number counted.
+    base_seq: Int
+    // The sequence number after the last one that looked like a restart.
+    bad_seq: Int
+    // How many consecutive packets are still needed to end the probation.
+    probation: Int
+    // The packets counted so far.
+    received: Int
+    // `expected` at the last report.
+    expected_prior: Int
+    // `received` at the last report.
+    received_prior: Int
+    // The relative transit time of the last packet, in clock units.
+    transit: Int
+    // Whether `transit` holds a value; false before the first packet.
+    has_transit: Bool
+    // The interarrival jitter estimate scaled by 16.
+    jitter: Int
+    // The middle 32 bits of the NTP time of the last SR, or 0 for none.
+    lsr: Int
+    // When that SR arrived, in milliseconds, or -1 for none.
+    lsr_at_ms: Int
+
+// What a sender keeps about itself: the two counts an SR carries.
+pub @value
+struct RtpSender
+    // The packets sent.
+    packets: Int
+    // The payload octets sent, headers and padding not counted.
+    octets: Int
+
+// A source first heard with sequence number `seq`, on probation.
+//
+// `clock` is the clock rate of the payload in Hz; `source_arrival` counts in
+// it.  The packet itself is then given to `source_update`.
+pub @tier(embedded)
+@no_alloc
+fn source_new(ssrc: Int, seq: Int, clock: Int) -> RtpSource []
+    RtpSource { ssrc: ssrc, clock: clock, max_seq: (seq - 1) & 0xFFFF, cycles: 0, base_seq: seq,
+                bad_seq: RTP_SEQ_MOD + 1, probation: RTP_MIN_SEQUENTIAL, received: 0,
+                expected_prior: 0, received_prior: 0, transit: 0, has_transit: false, jitter: 0,
+                lsr: 0, lsr_at_ms: -1 }
+
+// Start the sequence numbers of a source over from `seq` (A.1 `init_seq`).
+@tier(embedded)
+@no_alloc
+fn seq_restart(var s: RtpSource, seq: Int) []
+    s.base_seq = seq
+    s.max_seq = seq
+    s.bad_seq = RTP_SEQ_MOD + 1
+    s.cycles = 0
+    s.received = 0
+    s.received_prior = 0
+    s.expected_prior = 0
+
+// Take a packet's sequence number into account, and answer whether the
+// source is to be believed (A.1 `update_seq`).
+//
+// False means the packet is not counted: it is on probation, or it is a
+// jump that may be a restart of the source and is waiting for the packet
+// after it to say.  True means it was counted, whether it was in order, late
+// or a duplicate.
+//
+// ```novo
+// use rtpstat
+//
+// fn main() [io]
+//     var s = rtpstat.source_new(1, 100, 8000)
+//     let a = rtpstat.source_update(var s, 100)
+//     let b = rtpstat.source_update(var s, 101)
+//     println("${a} ${b} ${s.received} ${s.base_seq}")   // false true 1 101
+// ```
+pub @tier(embedded)
+@no_alloc
+fn source_update(var s: RtpSource, seq: Int) -> Bool []
+    if s.probation > 0
+        if seq == ((s.max_seq + 1) & 0xFFFF)
+            s.probation = s.probation - 1
+            s.max_seq = seq
+            if s.probation == 0
+                seq_restart(var s, seq)
+                s.received = s.received + 1
+                return true
+        else
+            s.probation = RTP_MIN_SEQUENTIAL - 1
+            s.max_seq = seq
+        return false
+    let udelta = (seq - s.max_seq) & 0xFFFF
+    if udelta < RTP_MAX_DROPOUT
+        if seq < s.max_seq
+            s.cycles = s.cycles + RTP_SEQ_MOD
+        s.max_seq = seq
+    else if udelta <= RTP_SEQ_MOD - RTP_MAX_MISORDER
+        if seq == s.bad_seq
+            seq_restart(var s, seq)
+        else
+            s.bad_seq = (seq + 1) & (RTP_SEQ_MOD - 1)
+            return false
+    s.received = s.received + 1
+    true
+
+// Whether the source has left probation.
+pub @tier(embedded)
+@no_alloc
+fn source_valid(s: RtpSource) -> Bool []
+    s.probation == 0
+
+// The extended highest sequence number received: the cycle count in the
+// high 16 bits and the highest number in the low 16.
+pub @tier(embedded)
+@no_alloc
+fn source_ext_seq(s: RtpSource) -> Int []
+    s.cycles + s.max_seq
+
+// The number of packets expected so far: the extended highest sequence number
+// minus the base, plus one.
+pub @tier(embedded)
+@no_alloc
+fn source_expected(s: RtpSource) -> Int []
+    source_ext_seq(s) - s.base_seq + 1
+
+// The cumulative number of packets lost: expected minus received.  Negative
+// when duplicates arrived.  Not held to the 24 bits a report carries.
+pub @tier(embedded)
+@no_alloc
+fn source_lost(s: RtpSource) -> Int []
+    source_expected(s) - s.received
+
+// A number held to the signed 32-bit range by wrapping.
+@tier(embedded)
+@no_alloc
+fn signed32(v: Int) -> Int []
+    ((v + 0x80000000) & rtpbytes.U32) - 0x80000000
+
+// Convert a time in milliseconds to units of a clock of `clock` Hz.
+//
+// ```novo
+// use rtpstat
+//
+// fn main() [io]
+//     println("${rtpstat.ms_to_units(20, 8000)} ${rtpstat.ms_to_units(1000, 90000)}")   // 160 90000
+// ```
+pub @tier(embedded)
+@no_alloc
+fn ms_to_units(ms: Int, clock: Int) -> Int []
+    ms * clock / 1000
+
+// Take a packet's arrival into the jitter estimate (A.8).
+//
+// `arrival` is when the packet arrived, in units of the payload's clock
+// (use `ms_to_units`), and `rtp_ts` is the timestamp it carries.  Both are
+// compared modulo 2^32, so a timestamp that wraps does not move the
+// estimate.  The first packet only sets the transit time.
+//
+// ```novo
+// use rtpstat
+//
+// fn main() [io]
+//     var s = rtpstat.source_new(1, 0, 8000)
+//     rtpstat.source_arrival(var s, 1000, 0)
+//     rtpstat.source_arrival(var s, 1176, 160)
+//     println("${s.jitter} ${rtpstat.source_jitter(s)}")   // 16 1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn source_arrival(var s: RtpSource, arrival: Int, rtp_ts: Int) []
+    let transit = signed32(arrival - rtp_ts)
+    if s.has_transit
+        var d = signed32(transit - s.transit)
+        if d < 0
+            d = 0 - d
+        s.jitter = s.jitter + d - ((s.jitter + 8) >> 4)
+    s.transit = transit
+    s.has_transit = true
+
+// The interarrival jitter estimate in units of the payload's clock.
+pub @tier(embedded)
+@no_alloc
+fn source_jitter(s: RtpSource) -> Int []
+    s.jitter >> 4
+
+// Note a sender report from this source: the middle 32 bits of its NTP time,
+// and `now_ms`, when it arrived, for the delay in the next report.
+pub @tier(embedded)
+@no_alloc
+fn source_sr(var s: RtpSource, ntp_hi: Int, ntp_lo: Int, now_ms: Int) []
+    s.lsr = ntp_middle(ntp_hi, ntp_lo)
+    s.lsr_at_ms = now_ms
+
+// The report block for this source at `now_ms`, and the intervals closed:
+// the fraction lost counts from the previous call (A.3).
+//
+// The cumulative loss is held to the 24-bit signed range of the field, the
+// fraction to 0 through 255 and the jitter to 32 bits.  `dlsr` is 0 when no
+// SR has arrived from the source.
+//
+// ```novo
+// use rtpstat
+//
+// fn main() [io]
+//     var s = rtpstat.source_new(5, 10, 8000)
+//     let _ = rtpstat.source_update(var s, 10)
+//     let _ = rtpstat.source_update(var s, 11)
+//     let _ = rtpstat.source_update(var s, 13)
+//     let r = rtpstat.source_report(var s, 0)
+//     println("${r.ext_seq} ${r.lost} ${r.fraction}")   // 13 1 85
+// ```
+pub @tier(embedded)
+@no_alloc
+fn source_report(var s: RtpSource, now_ms: Int) -> RtcpReportBlock []
+    let expected = source_expected(s)
+    var lost = expected - s.received
+    if lost > 0x7FFFFF
+        lost = 0x7FFFFF
+    if lost < 0 - 0x800000
+        lost = 0 - 0x800000
+    let expected_interval = expected - s.expected_prior
+    s.expected_prior = expected
+    let received_interval = s.received - s.received_prior
+    s.received_prior = s.received
+    let lost_interval = expected_interval - received_interval
+    var fraction = 0
+    if expected_interval > 0 and lost_interval > 0
+        fraction = (lost_interval << 8) / expected_interval
+        if fraction > 255
+            fraction = 255
+    var dlsr = 0
+    if s.lsr_at_ms >= 0
+        dlsr = rtpbytes.wrap32((now_ms - s.lsr_at_ms) * 65536 / 1000)
+    RtcpReportBlock { ssrc: s.ssrc, fraction: fraction, lost: lost,
+                      ext_seq: rtpbytes.wrap32(source_ext_seq(s)),
+                      jitter: rtpbytes.wrap32(s.jitter >> 4), lsr: s.lsr, dlsr: dlsr }
+
+// The middle 32 bits of an NTP time: the low 16 bits of the seconds and the
+// high 16 bits of the fraction.  This is the LSR a report carries.
+//
+// ```novo
+// use rtpstat
+//
+// fn main() [io]
+//     println("${rtpstat.ntp_middle(0x1234ABCD, 0x89EF0000)}")   // 2882374127
+// ```
+pub @tier(embedded)
+@no_alloc
+fn ntp_middle(ntp_hi: Int, ntp_lo: Int) -> Int []
+    ((ntp_hi & 0xFFFF) << 16) | ((ntp_lo >> 16) & 0xFFFF)
+
+// The seconds half of the NTP time of an instant given in milliseconds since
+// the NTP epoch, 1900-01-01.  The caller's clock supplies the milliseconds.
+pub @tier(embedded)
+@no_alloc
+fn ntp_hi_of_ms(ms: Int) -> Int []
+    (ms / 1000) & rtpbytes.U32
+
+// The fraction half of the NTP time of an instant given in milliseconds since
+// the NTP epoch, in 2^-32 seconds.
+pub @tier(embedded)
+@no_alloc
+fn ntp_lo_of_ms(ms: Int) -> Int []
+    ((ms % 1000) << 32) / 1000
+
+// The round trip, in 1/65536 seconds, from the report block a peer sent back
+// to us (section 6.4.1).
+//
+// `now_middle` is the middle 32 bits of the NTP time at which the report
+// block arrived (`ntp_middle`), and `lsr` and `dlsr` are the block's.  The
+// answer is `now_middle - lsr - dlsr` modulo 2^32, or -1 when `lsr` is 0 (the
+// peer has not heard a sender report from us).
+pub @tier(embedded)
+@no_alloc
+fn rtt_units(now_middle: Int, lsr: Int, dlsr: Int) -> Int []
+    if lsr == 0
+        return -1
+    rtpbytes.wrap32(now_middle - lsr - dlsr)
+
+// The round trip in milliseconds, or -1 as `rtt_units` answers it.
+//
+// ```novo
+// use rtpstat
+//
+// fn main() [io]
+//     // An SR left at middle time 0x00010000, came back at 0x00018000 with a
+//     // peer delay of 0x4000 (a quarter second): half a second minus a quarter.
+//     println("${rtpstat.rtt_ms(0x00018000, 0x00010000, 0x4000)}")   // 250
+// ```
+pub @tier(embedded)
+@no_alloc
+fn rtt_ms(now_middle: Int, lsr: Int, dlsr: Int) -> Int []
+    let u = rtt_units(now_middle, lsr, dlsr)
+    if u < 0
+        return -1
+    u * 1000 / 65536
+
+// A sender with nothing sent.
+pub @tier(embedded)
+@no_alloc
+fn sender_new() -> RtpSender []
+    RtpSender { packets: 0, octets: 0 }
+
+// Count one packet of `payload_len` payload octets, counts held to 32 bits.
+pub @tier(embedded)
+@no_alloc
+fn sender_on_packet(var s: RtpSender, payload_len: Int) []
+    s.packets = rtpbytes.wrap32(s.packets + 1)
+    s.octets = rtpbytes.wrap32(s.octets + payload_len)

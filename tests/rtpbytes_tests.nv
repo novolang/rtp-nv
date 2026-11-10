@@ -1,0 +1,76 @@
+// rtpbytes_tests.nv — the big-endian reads and writes.
+//
+// The expected bytes are written out by hand: 0x12345678 is 12 34 56 78 in
+// network order, and a 16-bit 0xBEDE is BE DE.
+
+use std.test
+use rtpbytes
+
+@test
+fn test_writes_are_big_endian_and_reads_agree() [io]
+    var m: rtpbytes.RtpBuf = Vec.new()
+    test.assert(rtpbytes.put_u8(var m, 0x1FF))
+    test.assert(rtpbytes.put_u16(var m, 0xBEDE))
+    test.assert(rtpbytes.put_u32(var m, 0x12345678))
+    test.assert_eq(m.len(), 7)
+    test.assert_eq(rtpbytes.get_u8(var m, 0), 0xFF)
+    test.assert_eq(rtpbytes.get_u16(var m, 1), 0xBEDE)
+    test.assert_eq(rtpbytes.get_u32(var m, 3), 0x12345678)
+    test.assert_eq(rtpbytes.get_u8(var m, 3), 0x12)
+    test.assert_eq(rtpbytes.get_u8(var m, 6), 0x78)
+
+@test
+fn test_reads_outside_the_buffer_answer_zero() [io]
+    var m: rtpbytes.RtpBuf = Vec.new()
+    let _ = rtpbytes.put_u32(var m, 0xFFFFFFFF)
+    test.assert_eq(rtpbytes.get_u8(var m, 4), 0)
+    test.assert_eq(rtpbytes.get_u8(var m, -1), 0)
+    test.assert_eq(rtpbytes.get_u16(var m, 3), 0)
+    test.assert_eq(rtpbytes.get_u16(var m, -1), 0)
+    test.assert_eq(rtpbytes.get_u32(var m, 1), 0)
+    test.assert_eq(rtpbytes.get_u32(var m, -1), 0)
+    test.assert_eq(rtpbytes.get_u32(var m, 0), 0xFFFFFFFF)
+
+@test
+fn test_overwrites_stay_inside_the_buffer() [io]
+    var m: rtpbytes.RtpBuf = Vec.new()
+    let _ = rtpbytes.put_u32(var m, 0)
+    test.assert(rtpbytes.set_u16(var m, 1, 0xABCD))
+    test.assert_eq(rtpbytes.get_u32(var m, 0), 0x00ABCD00)
+    test.assert(not rtpbytes.set_u16(var m, 3, 1))
+    test.assert(not rtpbytes.set_u16(var m, -1, 1))
+    test.assert(rtpbytes.set_u8(var m, 3, 0x1EE))
+    test.assert_eq(rtpbytes.get_u8(var m, 3), 0xEE)
+    test.assert(not rtpbytes.set_u8(var m, 4, 1))
+    test.assert(not rtpbytes.set_u8(var m, -1, 1))
+
+@test
+fn test_strings_zeros_and_comparison() [io]
+    var m: rtpbytes.RtpBuf = Vec.new()
+    test.assert(rtpbytes.put_str(var m, "abc"))
+    test.assert(rtpbytes.put_zeros(var m, 2))
+    test.assert_eq(m.len(), 5)
+    test.assert(rtpbytes.eq_str(var m, 0, 3, "abc"))
+    test.assert(rtpbytes.eq_str(var m, 3, 2, "\0\0"))
+    test.assert(not rtpbytes.eq_str(var m, 0, 3, "abd"))
+    test.assert(not rtpbytes.eq_str(var m, 0, 2, "abc"))
+    test.assert(not rtpbytes.eq_str(var m, 4, 3, "abc"))
+    test.assert(not rtpbytes.eq_str(var m, -1, 3, "abc"))
+
+@test
+fn test_a_full_buffer_refuses_writes() [io]
+    var m: rtpbytes.RtpBuf = Vec.new()
+    for _i in 0..1500
+        test.assert(rtpbytes.put_u8(var m, 1))
+    test.assert(not rtpbytes.put_u8(var m, 1))
+    test.assert(not rtpbytes.put_u16(var m, 1))
+    test.assert(not rtpbytes.put_u32(var m, 1))
+    test.assert(not rtpbytes.put_str(var m, "a"))
+    test.assert(not rtpbytes.put_zeros(var m, 1))
+    test.assert_eq(m.len(), 1500)
+
+@test
+fn test_values_wrap_at_two_to_the_32() [io]
+    test.assert_eq(rtpbytes.wrap32(0x100000001), 1)
+    test.assert_eq(rtpbytes.wrap32(5), 5)
+    test.assert_eq(rtpbytes.wrap32(-1), 0xFFFFFFFF)
