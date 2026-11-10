@@ -32,8 +32,6 @@
 // alone, plans on a BYE-sized average, and counts the BYEs it hears
 // (`timer_bye` and `timer_bye_heard`).
 
-use rtpbytes
-
 // The shortest interval between RTCP packets after the first, in
 // milliseconds: 5000.
 pub const RTCP_MIN_MS = 5000

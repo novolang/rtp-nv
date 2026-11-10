@@ -8,7 +8,6 @@
 
 use std.test
 use rtcptimer
-use rtcpwire
 use rtpstat
 use rtpstatic
 
