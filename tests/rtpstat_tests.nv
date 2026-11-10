@@ -88,6 +88,11 @@ fn test_duplicates_late_packets_and_restarts() [io]
     test.assert_eq(t.max_seq, 7001)
     test.assert_eq(t.received, 1)
 
+    test.case("a jump of exactly 3000 is not a lost run")
+    var edge = live(2000)
+    test.assert(not rtpstat.source_update(var edge, 5000))
+    test.assert_eq(edge.bad_seq, 5001)
+
     test.case("two different jumps in a row restart nothing")
     var u = live(2000)
     test.assert(not rtpstat.source_update(var u, 7000))
@@ -182,6 +187,16 @@ fn test_interarrival_jitter() [io]
     rtpstat.source_arrival(var s, 1300, 320)
     test.assert_eq(s.jitter, 51)
     test.assert_eq(rtpstat.source_jitter(s), 3)
+
+    test.case("the rounding term of the estimate: eight units late, then on time, leaves 7")
+    // transit 1000, 1008, 1008: D = 8 gives J = 8; D = 0 gives
+    // J = 8 + 0 - ((8 + 8) >> 4) = 7.  A rounding term of 7 would leave 8.
+    var r8 = rtpstat.source_new(1, 0, 8000)
+    rtpstat.source_arrival(var r8, 1000, 0)
+    rtpstat.source_arrival(var r8, 1168, 160)
+    test.assert_eq(r8.jitter, 8)
+    rtpstat.source_arrival(var r8, 1328, 320)
+    test.assert_eq(r8.jitter, 7)
 
     test.case("an arrival earlier than the pace makes a negative difference, taken as magnitude")
     var t = rtpstat.source_new(1, 0, 8000)

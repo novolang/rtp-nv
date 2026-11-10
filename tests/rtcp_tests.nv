@@ -556,3 +556,15 @@ fn test_a_bye_reason_that_runs_past_the_packet_has_no_length() [io]
     var it = rtcpwire.rtcp_iter(var m)
     test.assert(rtcpwire.rtcp_next(var m, var it))
     test.assert_eq(rtcpwire.bye_reason_len(var m, it), 0)
+
+@test
+fn test_padding_may_fill_the_whole_body() [io]
+    // A packet of an unknown type (207) that is the header and 4 bytes of
+    // padding and nothing else: the P bit, length 1, and the padding 00 00 00
+    // 04.  The count is the whole of what follows the header, which is allowed.
+    var m = pkt_of([0x80, 0xC9, 0x00, 0x01, 0, 0, 0, 1, 0xA0, 0xCF, 0x00, 0x01, 0, 0, 0, 4])
+    test.assert_eq(rtcpwire.rtcp_check(var m), rtcpwire.RTCP_OK)
+    var it = rtcpwire.rtcp_iter(var m)
+    test.assert(rtcpwire.rtcp_next(var m, var it))
+    test.assert(rtcpwire.rtcp_next(var m, var it))
+    test.assert_eq(it.body_len, 0)
