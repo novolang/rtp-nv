@@ -488,3 +488,82 @@ fn test_sequence_numbers_and_timestamps_wrap() [io]
     test.assert(not rtpwire.seq_newer(65535, 1))
     test.assert_eq(rtpwire.ts_add(0xFFFFFFF0, 0x20), 0x10)
     test.assert_eq(rtpwire.ts_add(100, 160), 260)
+
+// THE VECTORS BELOW ARE FROM pion/rtp, `packet_test.go` (MIT), as fetched
+// from github.com/pion/rtp on 2026-11-10: the raw byte arrays of TestBasic
+// and of the extension tests, and the values that file expects them to parse
+// to.  They are an independent implementation's reading of the same RFCs.
+// pion/rtcp's test vectors were looked at and not used: several of its
+// packets carry a length field that does not match the bytes that follow, so
+// they are not valid compound packets by Appendix A.2.
+
+@test
+fn test_pion_basic_packet_with_a_raw_extension() [io]
+    // 0x90 0xe0: version 2, extension, marker, payload type 96; sequence
+    // 27023, timestamp 3653407706, SSRC 476325762; the extension has profile
+    // 1 and one word FF FF FF FF; the payload is 98 36 be 88 9e.
+    var p = pkt_of([0x90, 0xe0, 0x69, 0x8f, 0xd9, 0xc2, 0x93, 0xda, 0x1c, 0x64, 0x27, 0x82,
+                    0x00, 0x01, 0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x98, 0x36, 0xbe, 0x88,
+                    0x9e])
+    let h = rtpwire.parse(var p)
+    test.assert(rtpwire.header_ok(h))
+    test.assert(h.marker)
+    test.assert(h.has_ext)
+    test.assert_eq(h.ext_profile, 1)
+    test.assert_eq(h.pt, 96)
+    test.assert_eq(h.seq, 27023)
+    test.assert_eq(h.timestamp, 3653407706)
+    test.assert_eq(h.ssrc, 476325762)
+    test.assert_eq(h.payload_off, 20)
+    test.assert_eq(h.payload_len, 5)
+    test.assert_eq(rtpwire.payload_byte(var p, h, 0), 0x98)
+
+    test.case("the same packet with the P bit and a count of 4 has one payload byte")
+    var q = pkt_of([0xb0, 0xe0, 0x69, 0x8f, 0xd9, 0xc2, 0x93, 0xda, 0x1c, 0x64, 0x27, 0x82,
+                    0x00, 0x01, 0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x98, 0x36, 0xbe, 0x88,
+                    0x04])
+    let hq = rtpwire.parse(var q)
+    test.assert(rtpwire.header_ok(hq))
+    test.assert_eq(hq.pad_len, 4)
+    test.assert_eq(hq.payload_off, 20)
+    test.assert_eq(hq.payload_len, 1)
+
+@test
+fn test_pion_one_byte_extensions() [io]
+    test.case("one element with ID 5 and a payload after two bytes of padding")
+    var a = pkt_of([0x90, 0xe0, 0x69, 0x8f, 0xd9, 0xc2, 0x93, 0xda, 0x1c, 0x64, 0x27, 0x82,
+                    0xBE, 0xDE, 0x00, 0x01, 0x50, 0xAA, 0x00, 0x00, 0x98, 0x36, 0xbe, 0x88,
+                    0x9e])
+    let ha = rtpwire.parse(var a)
+    let ea = rtpwire.ext_find(var a, ha, 5)
+    test.assert_eq(ea.data_len, 1)
+    test.assert_eq(rtpbytes.get_u8(var a, ea.data_off), 0xAA)
+    test.assert_eq(ha.payload_len, 5)
+
+    test.case("two elements, IDs 1 and 2, each of one byte")
+    var b = pkt_of([0x90, 0xe0, 0x69, 0x8f, 0xd9, 0xc2, 0x93, 0xda, 0x1c, 0x64, 0x27, 0x82,
+                    0xBE, 0xDE, 0x00, 0x01, 0x10, 0xAA, 0x20, 0xBB, 0x98, 0x36, 0xbe, 0x88,
+                    0x9e])
+    let hb = rtpwire.parse(var b)
+    test.assert_eq(rtpbytes.get_u8(var b, rtpwire.ext_find(var b, hb, 1).data_off), 0xAA)
+    test.assert_eq(rtpbytes.get_u8(var b, rtpwire.ext_find(var b, hb, 2).data_off), 0xBB)
+    test.assert_eq(rtpwire.ext_find(var b, hb, 3).data_len, -1)
+
+    test.case("padding between elements: ID 1 (AA), ID 2 (BB BB), two zeros, ID 3 (CC x4)")
+    var c = pkt_of([0x90, 0xe0, 0x69, 0x8f, 0xd9, 0xc2, 0x93, 0xda, 0x1c, 0x64, 0x27, 0x82,
+                    0xBE, 0xDE, 0x00, 0x03, 0x10, 0xAA, 0x21, 0xBB, 0xBB, 0x00, 0x00, 0x33,
+                    0xCC, 0xCC, 0xCC, 0xCC, 0x98, 0x36, 0xbe, 0x88, 0x9e])
+    let hc = rtpwire.parse(var c)
+    var it = rtpwire.ext_iter(hc)
+    test.assert(rtpwire.ext_next(var c, var it))
+    test.assert_eq(it.id, 1)
+    test.assert_eq(it.data_len, 1)
+    test.assert(rtpwire.ext_next(var c, var it))
+    test.assert_eq(it.id, 2)
+    test.assert_eq(it.data_len, 2)
+    test.assert(rtpwire.ext_next(var c, var it))
+    test.assert_eq(it.id, 3)
+    test.assert_eq(it.data_len, 4)
+    test.assert_eq(rtpbytes.get_u8(var c, it.data_off + 3), 0xCC)
+    test.assert(not rtpwire.ext_next(var c, var it))
+    test.assert_eq(hc.payload_off, 28)

@@ -184,7 +184,9 @@ rather than from an implementation.
 `tests/rtpwire_tests.nv` holds the packet to byte strings worked out by hand
 from sections 5.1 of RFC 3550 and from RFC 8285, including both extension
 forms, padding between elements, the reserved ID 15, and every parse fault and
-every way a builder refuses.
+every way a builder refuses. It also holds the byte arrays of pion/rtp's
+`packet_test.go` (MIT) and the values that file expects them to parse to, an
+independent implementation's reading of the same RFCs.
 
 `tests/rtcp_tests.nv` holds a compound packet (SR with a report block, SDES,
 BYE) to the byte, the APP packet, padding, every check of Appendix A.2 and

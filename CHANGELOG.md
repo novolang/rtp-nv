@@ -48,7 +48,8 @@ The first release.
   microphone, built for `--target=nrf52-qemu`. It prints `PASS: rtp-embedded`
   under QEMU. The image is 25,912 bytes of flash and 520 bytes of static RAM.
 - Four test suites with vectors worked out by hand, among them a compound
-  packet (SR with a report block, SDES, BYE) to the byte.
+  packet (SR with a report block, SDES, BYE) to the byte, and the RTP byte
+  arrays of pion/rtp's `packet_test.go`.
 
 ### Not included
 
